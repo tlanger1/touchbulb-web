@@ -136,7 +136,7 @@
   </section>
 
   <section>
-    <details>
+    <details id="logDetails">
       <summary>Activity log and notes</summary>
       <label style="display:block;margin-top:10px">
         <input id="logReplies" type="checkbox">
@@ -193,7 +193,7 @@ const els = {
   disconnectAllBtn: $('disconnectAllBtn'), modeSet: $('modeSet'), slider: $('slider'),
   sliderValue: $('sliderValue'), sendForm: $('sendForm'), textEntry: $('textEntry'),
   sendBtn: $('sendBtn'), status: $('status'), log: $('log'), logReplies: $('logReplies'),
-  showAll: $('showAll'),
+  showAll: $('showAll'), logDetails: $('logDetails'),
 };
 
 // ---------------------------------------------------------------------------
@@ -307,21 +307,58 @@ function resetControls() {
 // ---------------------------------------------------------------------------
 // Connection handling
 // ---------------------------------------------------------------------------
-async function findService(server, uuid) {
+const describeError = (err) => (err && err.message) || String(err);
+const sameUuid = (a, b) => String(a).toLowerCase() === String(b).toLowerCase();
+
+// Ask the device for every service this page may use, then choose by UUID. Probing for a
+// service one by one relies on the browser reporting "not found" in the standard way, and
+// some browsers (for example Bluefy) report it differently. Returns null if unknown.
+async function listServices(server) {
   try {
-    return await server.getPrimaryService(uuid);
+    const services = await server.getPrimaryServices();
+    return services && services.length ? Array.from(services) : null;
   } catch (err) {
-    if (err && err.name === 'NotFoundError') return null;
-    throw err;
+    log('Service list not available (' + describeError(err) + '); probing one by one.');
+    return null;
   }
 }
 
-async function findCharacteristic(service, uuid) {
+async function listCharacteristics(service) {
+  try {
+    const chars = await service.getCharacteristics();
+    return chars && chars.length ? Array.from(chars) : null;
+  } catch (err) {
+    log('Characteristic list not available (' + describeError(err) + '); probing one by one.');
+    return null;
+  }
+}
+
+// Any error while probing counts as "not present", unless the link itself has dropped.
+async function findService(device, server, listed, uuid) {
+  if (listed) {
+    const hit = listed.find((s) => sameUuid(s.uuid, uuid));
+    if (hit) return hit;
+  }
+  try {
+    return await server.getPrimaryService(uuid);
+  } catch (err) {
+    if (!device.gatt.connected) throw err;
+    log('Service ' + uuid.slice(0, 8) + ' not available: ' + (err && err.name) + ': ' + describeError(err));
+    return null;
+  }
+}
+
+async function findCharacteristic(device, service, listed, uuid) {
+  if (listed) {
+    const hit = listed.find((c) => sameUuid(c.uuid, uuid));
+    if (hit) return hit;
+  }
   try {
     return await service.getCharacteristic(uuid);
   } catch (err) {
-    if (err && err.name === 'NotFoundError') return null;
-    throw err;
+    if (!device.gatt.connected) throw err;
+    log('Characteristic ' + uuid.slice(0, 8) + ' not available: ' + (err && err.name) + ': ' + describeError(err));
+    return null;
   }
 }
 
@@ -333,35 +370,55 @@ async function setupConnection(device) {
                  service: null, characteristic: null, closing: false };
   device.addEventListener('gattserverdisconnected', () => onDisconnected(conn));
 
-  const server = await withTimeout(device.gatt.connect(), CONNECT_TIMEOUT_MS,
-                                   'Connection timed out after 30 seconds.');
+  // `stage` records how far setup got, so a failure can say which step went wrong.
+  let stage = 'connecting to the device';
+  try {
+    const server = await withTimeout(device.gatt.connect(), CONNECT_TIMEOUT_MS,
+                                     'Connection timed out after 30 seconds.');
 
-  let service = await findService(server, CODELESS_SERVICE);
-  if (service) {
-    const ch = await findCharacteristic(service, CODELESS_IN);
-    if (!ch || !ch.properties.write) {
-      throw new Error('CodeLess requires a write-with-response characteristic.');
+    stage = 'listing the device services';
+    const services = await listServices(server);
+    log('Services reported: ' + (services ? services.map((s) => s.uuid).join(', ') : '(none, probing)'));
+
+    stage = 'looking for the CodeLess or DX service';
+    let service = await findService(device, server, services, CODELESS_SERVICE);
+    if (service) {
+      stage = 'opening the CodeLess characteristic';
+      const chars = await listCharacteristics(service);
+      const ch = await findCharacteristic(device, service, chars, CODELESS_IN);
+      if (!ch || !ch.properties.write) {
+        throw new Error('CodeLess requires a write-with-response characteristic.');
+      }
+      conn.profile = 'CodeLess';
+      conn.characteristic = ch;
+    } else {
+      service = await findService(device, server, services, DX_SERVICE);
+      if (!service) {
+        throw new Error('Neither supported service was found. ' +
+                        'The selected device may have different firmware or UUIDs.');
+      }
+      stage = 'opening the DX characteristic';
+      const chars = await listCharacteristics(service);
+      // FFE2 is the documented dedicated write characteristic; fall back to FFE1.
+      let ch = await findCharacteristic(device, service, chars, DX_WRITE);
+      if (!isWritable(ch)) ch = await findCharacteristic(device, service, chars, DX_READ_WRITE);
+      conn.profile = 'DX-BT24-T UART';
+      conn.characteristic = ch;
     }
-    conn.profile = 'CodeLess';
-    conn.characteristic = ch;
-  } else {
-    service = await findService(server, DX_SERVICE);
-    if (!service) {
-      throw new Error('Neither supported service was found. ' +
-                      'The selected device may have different firmware or UUIDs.');
+
+    stage = 'final checks';
+    if (!isWritable(conn.characteristic)) {
+      throw new Error('The expected writable characteristic was not found.');
     }
-    // FFE2 is the documented dedicated write characteristic; fall back to FFE1.
-    let ch = await findCharacteristic(service, DX_WRITE);
-    if (!isWritable(ch)) ch = await findCharacteristic(service, DX_READ_WRITE);
-    conn.profile = 'DX-BT24-T UART';
-    conn.characteristic = ch;
+    if (!device.gatt.connected) throw new Error('The device disconnected during setup.');
+    conn.service = service;
+    return conn;
+  } catch (err) {
+    const wrapped = new Error(describeError(err));
+    wrapped.name = (err && err.name) || 'Error';
+    wrapped.stage = stage;
+    throw wrapped;
   }
-  if (!isWritable(conn.characteristic)) {
-    throw new Error('The expected writable characteristic was not found.');
-  }
-  if (!device.gatt.connected) throw new Error('The device disconnected during setup.');
-  conn.service = service;
-  return conn;
 }
 
 async function connectDevice() {
@@ -406,8 +463,10 @@ async function connectDevice() {
     setStatus('Connected to ' + conn.name + ' (' + conn.profile + '), no pairing needed.', 'ok');
   } catch (err) {
     try { if (device.gatt.connected) device.gatt.disconnect(); } catch (_) { /* ignore */ }
-    log('Connection failed: ' + ((err && err.message) || err));
-    setStatus(friendlyError(err, 'Pairing / connection'), 'error');
+    const stepText = err && err.stage ? ' (step: ' + err.stage + ')' : '';
+    log('Connection failed' + stepText + ': ' + ((err && err.name) || 'Error') + ': ' + describeError(err));
+    setStatus(friendlyError(err, 'Pairing / connection') + stepText, 'error');
+    els.logDetails.open = true;     // show the log so the cause can be read on the phone
   } finally {
     busy = false;
     updateUI();
