@@ -1,0 +1,618 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TouchBulb BLE Controller</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --card: #ffffff; --text: #1b1f24; --muted: #5b6573;
+    --accent: #0b5fff; --accent-text: #ffffff; --border: #d3d9e0;
+    --danger: #b3261e; --ok: #1a7f37;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #101317; --card: #1a1f26; --text: #e8ecf1; --muted: #9aa5b4;
+      --accent: #4c8dff; --accent-text: #0b0f14; --border: #2c3440;
+      --danger: #ff8a80; --ok: #56d364;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px; background: var(--bg); color: var(--text);
+    font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 640px; margin: 0 auto; display: grid; gap: 14px; }
+  h1 { font-size: 1.4rem; margin: 0; }
+  .sub { color: var(--muted); margin: 2px 0 0; font-size: 0.9rem; }
+  section {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 14px;
+  }
+  h2 { font-size: 1rem; margin: 0 0 10px; }
+  .banner {
+    border: 1px solid var(--danger); color: var(--danger);
+    border-radius: 12px; padding: 12px; background: var(--card);
+  }
+  .banner[hidden] { display: none; }
+  button {
+    font: inherit; padding: 10px 14px; border-radius: 10px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--card); color: var(--text);
+    min-height: 44px;
+  }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .device {
+    display: flex; justify-content: space-between; align-items: center; gap: 10px;
+    padding: 6px 0; border-top: 1px solid var(--border);
+  }
+  .device:first-child { border-top: 0; }
+  .showall {
+    display: flex; align-items: flex-start; gap: 10px; margin-top: 10px;
+    min-height: 44px; padding: 6px 0; font-size: 0.9rem; color: var(--muted);
+  }
+  .showall input { width: 22px; height: 22px; flex: none; margin: 0; }
+  .device .name { overflow-wrap: anywhere; }
+  .device .profile { color: var(--muted); font-size: 0.85rem; }
+  .none { color: var(--muted); }
+  fieldset { border: 1px solid var(--border); border-radius: 10px; margin: 0; padding: 8px 12px; }
+  legend { padding: 0 6px; color: var(--muted); font-size: 0.9rem; }
+  fieldset label { display: inline-flex; align-items: center; gap: 6px; margin-right: 18px; min-height: 36px; }
+  .sliderbox { margin-top: 14px; }
+  .sliderhead { display: flex; justify-content: space-between; align-items: baseline; }
+  #sliderValue { font-size: 1.6rem; font-weight: 600; min-width: 1.5ch; text-align: right; }
+  input[type=range] { width: 100%; height: 44px; accent-color: var(--accent); }
+  .ticks { display: flex; justify-content: space-between; color: var(--muted); font-size: 0.8rem; padding: 0 6px; }
+  .sendrow { margin-top: 14px; display: flex; gap: 10px; }
+  .sendrow input[type=text] {
+    flex: 1; font: inherit; padding: 10px; border-radius: 10px; min-height: 44px;
+    border: 1px solid var(--border); background: var(--bg); color: var(--text);
+  }
+  #status { color: var(--muted); min-height: 1.4em; overflow-wrap: anywhere; }
+  #status.error { color: var(--danger); }
+  #status.ok { color: var(--ok); }
+  details summary { cursor: pointer; color: var(--muted); }
+  pre#log {
+    margin: 10px 0 0; max-height: 220px; overflow: auto; font-size: 0.8rem;
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 8px;
+    white-space: pre-wrap; overflow-wrap: anywhere;
+  }
+  ul.notes { margin: 8px 0 0; padding-left: 20px; color: var(--muted); font-size: 0.9rem; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>TouchBulb BLE Controller</h1>
+    <p class="sub">Web version of the Python BLE sender. Sends commands to one or more TouchBulb boards over Bluetooth Low Energy.</p>
+  </header>
+
+  <div id="banner" class="banner" role="alert" hidden></div>
+
+  <section aria-labelledby="devHead">
+    <h2 id="devHead">Connected BLE devices</h2>
+    <div id="deviceList"><span class="none">(none)</span></div>
+    <div class="row" style="margin-top:12px">
+      <button id="connectBtn" class="primary" type="button">Connect a BLE device</button>
+      <button id="disconnectAllBtn" type="button">Disconnect all</button>
+    </div>
+    <label class="showall">
+      <input id="showAll" type="checkbox">
+      Show all nearby devices (otherwise only names starting with BT24, DX-BT24 or Touch)
+    </label>
+  </section>
+
+  <section aria-labelledby="ctlHead">
+    <h2 id="ctlHead">Controls</h2>
+
+    <fieldset id="modeSet">
+      <legend>Operation mode</legend>
+      <label><input type="radio" name="mode" value="L" checked> Latched</label>
+      <label><input type="radio" name="mode" value="M"> Momentary</label>
+    </fieldset>
+
+    <div class="sliderbox">
+      <div class="sliderhead">
+        <label for="slider">Slide to send a digit (0&ndash;9)</label>
+        <output id="sliderValue" for="slider">0</output>
+      </div>
+      <input id="slider" type="range" min="0" max="9" step="1" value="0">
+      <div class="ticks" aria-hidden="true">
+        <span>0</span><span>1</span><span>2</span><span>3</span><span>4</span>
+        <span>5</span><span>6</span><span>7</span><span>8</span><span>9</span>
+      </div>
+    </div>
+
+    <form id="sendForm" class="sendrow">
+      <input id="textEntry" type="text" autocomplete="off" autocapitalize="off"
+             spellcheck="false" placeholder="Text to send" aria-label="Text to send">
+      <button id="sendBtn" type="submit">Send</button>
+    </form>
+  </section>
+
+  <section>
+    <div id="status" role="status" aria-live="polite">Not connected. Tap &ldquo;Connect a BLE device&rdquo;.</div>
+  </section>
+
+  <section>
+    <details>
+      <summary>Activity log and notes</summary>
+      <label style="display:block;margin-top:10px">
+        <input id="logReplies" type="checkbox">
+        Read and log the CodeLess module reply after each send (diagnostic, adds about 0.3 s per send)
+      </label>
+      <pre id="log" aria-label="Activity log"></pre>
+      <ul class="notes">
+        <li>A successful Bluetooth write does not prove the board's microcontroller received the text. Check the board's UART output or the LED.</li>
+        <li>Keep the screen on and this page in the foreground. Locking the phone or switching apps can drop the connection.</li>
+        <li>Only one program can hold a connection to a board at a time. Close the Python app before connecting here.</li>
+      </ul>
+    </details>
+  </section>
+</main>
+
+<script>
+'use strict';
+
+// ---------------------------------------------------------------------------
+// Constants (same UUIDs as the Python app)
+// ---------------------------------------------------------------------------
+const CODELESS_SERVICE = '866d3b04-e674-40dc-9c05-b7f91bec6e83';
+const CODELESS_IN      = '914f8fb9-e8cd-411d-b7d1-14594de45425';
+const CODELESS_OUT     = '3bb535aa-50b2-4fbe-aa09-6b06dc59a404'; // diagnostic read only
+const DX_SERVICE       = '0000ffe0-0000-1000-8000-00805f9b34fb';
+const DX_WRITE         = '0000ffe2-0000-1000-8000-00805f9b34fb';
+const DX_READ_WRITE    = '0000ffe1-0000-1000-8000-00805f9b34fb';
+
+// Web Bluetooth does not expose the MTU, so use conservative fixed limits.
+const CODELESS_MAX_PACKET = 150; // bytes incl. '|' prefix and CR
+const DX_CHUNK = 20;             // bytes per write (default MTU 23 - 3)
+const DX_CHUNK_DELAY_MS = 40;
+const CONNECT_TIMEOUT_MS = 30000;
+const SEND_TIMEOUT_MS = 15000;
+
+// The browser's own device picker cannot be resized by a page, so keep its list short:
+// only offer devices whose advertised name starts with one of these (case-sensitive).
+// The "Show all nearby devices" checkbox turns the filter off.
+const NAME_PREFIXES = ['BT24', 'DX-BT24', 'Touch'];
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+let connections = [];   // {device, profile, service, characteristic, name, closing}
+let busy = false;       // true while connecting or disconnecting
+let mode = 'L';
+let lastSlider = 0;
+const sendQueue = [];   // FIFO of strings, one command at a time (like the Python app)
+let pumping = false;
+
+const $ = (id) => document.getElementById(id);
+const els = {
+  banner: $('banner'), deviceList: $('deviceList'), connectBtn: $('connectBtn'),
+  disconnectAllBtn: $('disconnectAllBtn'), modeSet: $('modeSet'), slider: $('slider'),
+  sliderValue: $('sliderValue'), sendForm: $('sendForm'), textEntry: $('textEntry'),
+  sendBtn: $('sendBtn'), status: $('status'), log: $('log'), logReplies: $('logReplies'),
+  showAll: $('showAll'),
+};
+
+// ---------------------------------------------------------------------------
+// Small helpers
+// ---------------------------------------------------------------------------
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function withTimeout(promise, ms, message) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+function setStatus(text, kind) {
+  els.status.textContent = text;
+  els.status.className = kind || '';
+}
+
+function log(text) {
+  const stamp = new Date().toLocaleTimeString();
+  console.log(text);
+  const lines = (els.log.textContent + stamp + '  ' + text + '\n').split('\n');
+  els.log.textContent = lines.slice(-201).join('\n');
+  els.log.scrollTop = els.log.scrollHeight;
+}
+
+function isIos() {
+  return /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+         (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+}
+
+// Turn a browser/Bluetooth error into a plain-language message.
+function friendlyError(err, stage) {
+  const name = err && err.name;
+  const detail = (err && err.message) || String(err);
+  if (name === 'NetworkError') {
+    return stage + ' failed: the device could not be reached. Check that it is powered, in range, ' +
+           'and not connected to another program (for example the Python app on your PC).';
+  }
+  if (name === 'NotAllowedError' || name === 'SecurityError') {
+    return stage + ' was not allowed. Allow Bluetooth for this browser in its settings and try again.';
+  }
+  if (name === 'InvalidStateError') {
+    return stage + ' failed: the device is busy. Wait a moment and try again.';
+  }
+  return stage + ' failed: ' + detail;
+}
+
+// ---------------------------------------------------------------------------
+// UI state
+// ---------------------------------------------------------------------------
+function renderDevices() {
+  els.deviceList.textContent = '';
+  if (!connections.length) {
+    const none = document.createElement('span');
+    none.className = 'none';
+    none.textContent = '(none)';
+    els.deviceList.appendChild(none);
+    return;
+  }
+  for (const conn of connections) {
+    const row = document.createElement('div');
+    row.className = 'device';
+    const label = document.createElement('div');
+    const name = document.createElement('div');
+    name.className = 'name';
+    name.textContent = conn.name;            // textContent: device names are untrusted
+    const profile = document.createElement('div');
+    profile.className = 'profile';
+    profile.textContent = conn.profile;
+    label.append(name, profile);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = 'Disconnect';
+    btn.disabled = busy;
+    btn.addEventListener('click', () => disconnectOne(conn));
+    row.append(label, btn);
+    els.deviceList.appendChild(row);
+  }
+}
+
+function updateUI() {
+  const connected = connections.length > 0;
+  const usable = connected && !busy;
+  els.connectBtn.disabled = busy || !navigator.bluetooth;
+  els.connectBtn.textContent = connected ? 'Connect another BLE device' : 'Connect a BLE device';
+  els.disconnectAllBtn.disabled = !usable;
+  els.slider.disabled = !usable;
+  els.textEntry.disabled = !usable;
+  els.sendBtn.disabled = !usable;
+  for (const radio of els.modeSet.querySelectorAll('input')) radio.disabled = !usable;
+  renderDevices();
+}
+
+// Set mode radio + variable WITHOUT transmitting anything.
+function setModeWithoutSend(value) {
+  mode = value;
+  for (const radio of els.modeSet.querySelectorAll('input')) radio.checked = (radio.value === value);
+}
+
+function resetControls() {
+  // Opening a fresh session sends nothing; the UI just shows Latched / 0.
+  setModeWithoutSend('L');
+  els.slider.value = '0';
+  els.sliderValue.textContent = '0';
+  lastSlider = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Connection handling
+// ---------------------------------------------------------------------------
+async function findService(server, uuid) {
+  try {
+    return await server.getPrimaryService(uuid);
+  } catch (err) {
+    if (err && err.name === 'NotFoundError') return null;
+    throw err;
+  }
+}
+
+async function findCharacteristic(service, uuid) {
+  try {
+    return await service.getCharacteristic(uuid);
+  } catch (err) {
+    if (err && err.name === 'NotFoundError') return null;
+    throw err;
+  }
+}
+
+const isWritable = (ch) => !!ch && (ch.properties.write || ch.properties.writeWithoutResponse);
+
+// Detect the profile from the GATT services (not the advertised name).
+async function setupConnection(device) {
+  const conn = { device, name: device.name || device.id, profile: null,
+                 service: null, characteristic: null, closing: false };
+  device.addEventListener('gattserverdisconnected', () => onDisconnected(conn));
+
+  const server = await withTimeout(device.gatt.connect(), CONNECT_TIMEOUT_MS,
+                                   'Connection timed out after 30 seconds.');
+
+  let service = await findService(server, CODELESS_SERVICE);
+  if (service) {
+    const ch = await findCharacteristic(service, CODELESS_IN);
+    if (!ch || !ch.properties.write) {
+      throw new Error('CodeLess requires a write-with-response characteristic.');
+    }
+    conn.profile = 'CodeLess';
+    conn.characteristic = ch;
+  } else {
+    service = await findService(server, DX_SERVICE);
+    if (!service) {
+      throw new Error('Neither supported service was found. ' +
+                      'The selected device may have different firmware or UUIDs.');
+    }
+    // FFE2 is the documented dedicated write characteristic; fall back to FFE1.
+    let ch = await findCharacteristic(service, DX_WRITE);
+    if (!isWritable(ch)) ch = await findCharacteristic(service, DX_READ_WRITE);
+    conn.profile = 'DX-BT24-T UART';
+    conn.characteristic = ch;
+  }
+  if (!isWritable(conn.characteristic)) {
+    throw new Error('The expected writable characteristic was not found.');
+  }
+  if (!device.gatt.connected) throw new Error('The device disconnected during setup.');
+  conn.service = service;
+  return conn;
+}
+
+async function connectDevice() {
+  if (busy) return;
+  if (!navigator.bluetooth) { setStatus('This browser does not support Web Bluetooth.', 'error'); return; }
+
+  // requestDevice() must run straight from the tap (user activation) - no awaits before it.
+  // Read the checkbox synchronously, before any await.
+  const filtered = !els.showAll.checked;
+  const options = { optionalServices: [CODELESS_SERVICE, DX_SERVICE] };
+  if (filtered) options.filters = NAME_PREFIXES.map((namePrefix) => ({ namePrefix }));
+  else options.acceptAllDevices = true;
+
+  let device;
+  try {
+    device = await navigator.bluetooth.requestDevice(options);
+  } catch (err) {
+    if (err && err.name === 'NotFoundError') {
+      setStatus(filtered
+        ? 'No device was selected. If your board was not listed, tick "Show all nearby devices" and try again.'
+        : 'No device was selected.');
+      return;
+    }
+    setStatus(friendlyError(err, 'Device selection'), 'error');
+    return;
+  }
+
+  if (connections.some((c) => c.device.id === device.id)) {
+    setStatus('That device is already connected.');
+    return;
+  }
+
+  busy = true;
+  updateUI();
+  setStatus('Connecting to ' + (device.name || device.id) + '...');
+  try {
+    const conn = await setupConnection(device);
+    const first = connections.length === 0;
+    connections.push(conn);
+    if (first) resetControls();
+    log('Connected: ' + conn.name + ' (' + conn.profile + ')');
+    setStatus('Connected to ' + conn.name + ' (' + conn.profile + '), no pairing needed.', 'ok');
+  } catch (err) {
+    try { if (device.gatt.connected) device.gatt.disconnect(); } catch (_) { /* ignore */ }
+    log('Connection failed: ' + ((err && err.message) || err));
+    setStatus(friendlyError(err, 'Pairing / connection'), 'error');
+  } finally {
+    busy = false;
+    updateUI();
+  }
+}
+
+function removeConnection(conn) {
+  const before = connections.length;
+  connections = connections.filter((c) => c !== conn);
+  return connections.length !== before;
+}
+
+function onDisconnected(conn) {
+  if (conn.closing) return;                    // user-initiated; handled by the caller
+  if (!removeConnection(conn)) return;         // never made it into the list
+  log('Disconnected unexpectedly: ' + conn.name);
+  if (!connections.length) {
+    sendQueue.length = 0;
+    setStatus(conn.name + ' disconnected. Tap "Connect a BLE device" to reconnect.', 'error');
+  } else {
+    setStatus(conn.name + ' disconnected. ' + connections.length + ' BLE device(s) remain connected.', 'error');
+  }
+  updateUI();
+}
+
+function disconnectConnection(conn) {
+  conn.closing = true;
+  try { if (conn.device.gatt.connected) conn.device.gatt.disconnect(); } catch (err) {
+    log('Disconnect error for ' + conn.name + ': ' + ((err && err.message) || err));
+  }
+  removeConnection(conn);
+}
+
+function disconnectOne(conn) {
+  if (busy || !connections.includes(conn)) return;
+  disconnectConnection(conn);
+  log('Disconnected: ' + conn.name);
+  if (!connections.length) {
+    sendQueue.length = 0;
+    setStatus('Disconnected. Tap "Connect a BLE device" to reconnect.');
+  } else {
+    setStatus(conn.name + ' disconnected. ' + connections.length + ' BLE device(s) remain connected.');
+  }
+  updateUI();
+}
+
+function disconnectAll() {
+  if (busy) return;
+  sendQueue.length = 0;                        // discard queued digits
+  for (const conn of connections.slice()) disconnectConnection(conn);
+  log('Disconnected all devices');
+  setStatus('Disconnected.');
+  updateUI();
+}
+
+// ---------------------------------------------------------------------------
+// Sending (one command at a time, sent to every connected device)
+// ---------------------------------------------------------------------------
+function buildPacket(profile, text) {
+  const payload = new TextEncoder().encode(text);
+  const prefix = profile === 'CodeLess' ? [0x7c] : [];            // '|'
+  const suffix = profile === 'CodeLess' ? [0x0d] : [0x0d, 0x0a];  // CR  /  CR LF
+  const packet = new Uint8Array(prefix.length + payload.length + suffix.length);
+  packet.set(prefix, 0);
+  packet.set(payload, prefix.length);
+  packet.set(suffix, prefix.length + payload.length);
+  return { packet, payloadLength: payload.length };
+}
+
+// Prefer the explicit modern methods; fall back to writeValue() on older engines.
+async function writeChar(ch, data, withResponse) {
+  if (withResponse) {
+    return ch.writeValueWithResponse ? ch.writeValueWithResponse(data) : ch.writeValue(data);
+  }
+  return ch.writeValueWithoutResponse ? ch.writeValueWithoutResponse(data) : ch.writeValue(data);
+}
+
+const toHex = (view) => Array.from(new Uint8Array(view.buffer, view.byteOffset, view.byteLength))
+  .map((b) => b.toString(16).padStart(2, '0')).join(' ');
+
+async function transmitTo(conn, text) {
+  if (!conn.device.gatt.connected) throw new Error(conn.name + ' is disconnected.');
+  const { packet, payloadLength } = buildPacket(conn.profile, text);
+  const ch = conn.characteristic;
+
+  if (conn.profile === 'CodeLess') {
+    // One command must go out in ONE GATT write: splitting it would create commands.
+    if (packet.length > CODELESS_MAX_PACKET) {
+      throw new Error('For CodeLess use at most ' + (CODELESS_MAX_PACKET - 2) + ' bytes of text.');
+    }
+    await writeChar(ch, packet, true);
+    if (els.logReplies.checked) {               // best effort; must never fail a send
+      try {
+        await sleep(300);
+        const reply = await (await conn.service.getCharacteristic(CODELESS_OUT)).readValue();
+        log('CodeLess reply from ' + conn.name + ': ' + toHex(reply));
+      } catch (err) {
+        log('CodeLess reply not read: ' + ((err && err.message) || err));
+      }
+    }
+  } else {
+    // DX transparent UART: text + CR LF, chunked, with modest pacing.
+    const withResponse = !!ch.properties.write;
+    for (let offset = 0; offset < packet.length; offset += DX_CHUNK) {
+      await writeChar(ch, packet.slice(offset, offset + DX_CHUNK), withResponse);
+      await sleep(DX_CHUNK_DELAY_MS);
+    }
+  }
+  return payloadLength;
+}
+
+async function pump() {
+  if (pumping) return;
+  pumping = true;
+  try {
+    while (sendQueue.length) {
+      const text = sendQueue.shift();
+      const targets = connections.slice();
+      if (!targets.length) { sendQueue.length = 0; break; }
+      const results = await withTimeout(
+        Promise.allSettled(targets.map((conn) => transmitTo(conn, text))),
+        SEND_TIMEOUT_MS, 'Sending timed out after 15 seconds.');
+      const failed = results
+        .map((r, i) => ({ r, conn: targets[i] }))
+        .filter((x) => x.r.status === 'rejected');
+      if (failed.length) {
+        sendQueue.length = 0;                   // do not continue a backlog after a failure
+        const msg = failed.map((x) => x.conn.name + ': ' +
+          ((x.r.reason && x.r.reason.message) || x.r.reason)).join('; ');
+        log('Send failed: ' + msg);
+        setStatus('Send failed: ' + msg, 'error');
+      } else {
+        const count = results[0].value;
+        setStatus(count + ' text byte(s) submitted to ' + targets.length +
+                  ' BLE device(s). Check the UART monitor.', 'ok');
+      }
+    }
+  } catch (err) {
+    sendQueue.length = 0;
+    log('Send error: ' + ((err && err.message) || err));
+    setStatus('Send failed: ' + ((err && err.message) || err), 'error');
+  } finally {
+    pumping = false;
+  }
+}
+
+function queueText(text) {
+  if (busy || !connections.length) return;
+  sendQueue.push(text);
+  pump();
+}
+
+// ---------------------------------------------------------------------------
+// Controls
+// ---------------------------------------------------------------------------
+els.slider.addEventListener('input', () => {
+  const digit = parseInt(els.slider.value, 10);
+  els.sliderValue.textContent = String(digit);
+  if (digit === lastSlider) return;
+  lastSlider = digit;
+  if (mode === 'M') setModeWithoutSend('L');    // slider takes over: back to Latched, no 'L' sent
+  queueText(String(digit));
+});
+
+els.modeSet.addEventListener('change', (event) => {
+  if (event.target && event.target.name === 'mode') {
+    mode = event.target.value;
+    queueText(mode);                            // exactly 'L' or 'M'
+  }
+});
+
+els.sendForm.addEventListener('submit', (event) => {
+  event.preventDefault();
+  if (busy || !connections.length) return;
+  const text = els.textEntry.value;
+  if (!text) return;
+  if (/[\r\n\0]/.test(text)) {
+    setStatus('Use a single line without NUL characters.', 'error');
+    return;
+  }
+  if (mode === 'M' && text.length === 1 && text >= '1' && text <= '9') setModeWithoutSend('L');
+  queueText(text);
+});
+
+els.connectBtn.addEventListener('click', connectDevice);
+els.disconnectAllBtn.addEventListener('click', disconnectAll);
+
+// ---------------------------------------------------------------------------
+// Start-up checks
+// ---------------------------------------------------------------------------
+function showBanner(html) {
+  els.banner.textContent = html;
+  els.banner.hidden = false;
+}
+
+if (!navigator.bluetooth) {
+  showBanner(isIos()
+    ? 'This browser cannot control Bluetooth. On iPhone/iPad, open this page in the Bluefy browser ' +
+      '(free in the App Store). Safari and Chrome on iOS do not support Web Bluetooth.'
+    : 'This browser cannot control Bluetooth. Use Chrome or Edge on Windows, macOS, Linux or Android.');
+  setStatus('Web Bluetooth is not available in this browser.', 'error');
+} else if (!window.isSecureContext) {
+  showBanner('Web Bluetooth needs a secure page. Open this page over https:// (or http://localhost).');
+}
+updateUI();
+</script>
+</body>
+</html>
