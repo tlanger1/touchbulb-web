@@ -4,6 +4,19 @@ Upload index.html and release_notes.txt together to the same GitHub folder.
 The version number is also shown at the bottom of the page, so you can see
 whether the phone loaded the new file.
 
+Version 1.5 - 2026-11-25
+- New switch "Remember boards on this phone" at the top of "Manage devices",
+  OFF by default. Off: the page stores no board list on the phone and does not
+  use Bluefy's saved list; boards are kept only while the page stays open
+  (Reconnect saved devices still works after you leave Bluefy and come back, but
+  not after a reload). On: boards, "Last connected" and Reconnect saved devices
+  work across reloads, as in 1.1 to 1.4.
+- Switching it off, and the first time 1.5 loads (it starts off), deletes the
+  board memory that earlier versions stored on this phone. To get the saved
+  boards back, switch it on again; they reappear as "Never connected".
+- The switch setting is stored on the phone like the other settings. Nothing is
+  sent over the internet (a note says so in the advanced settings).
+
 Version 1.4 - 2026-11-25
 - New "Clear list" button in "Manage devices", next to "Connect all" and
   "Disconnect all". It asks for a second tap, then starts from scratch: it
