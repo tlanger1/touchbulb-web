@@ -50,6 +50,9 @@
   button:disabled { opacity: 0.45; cursor: not-allowed; }
   .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
   .summary { color: var(--text); overflow-wrap: anywhere; }
+  .hint { color: var(--muted); font-size: 0.9rem; margin-top: 4px; overflow-wrap: anywhere; }
+  .hint.attention { color: var(--danger); }
+  .hint[hidden] { display: none; }
   .dot {
     display: inline-block; width: 10px; height: 10px; border-radius: 50%;
     background: var(--danger); margin-left: 8px; vertical-align: middle;
@@ -134,6 +137,7 @@
   <section aria-labelledby="devHead">
     <h2 id="devHead">Boards</h2>
     <div id="boardSummary" class="summary">No boards yet. Tap &ldquo;Connect a BLE device&rdquo;.</div>
+    <div id="boardHint" class="hint" hidden></div>
     <div class="row" style="margin-top:12px">
       <button id="connectBtn" class="primary" type="button">Connect a BLE device</button>
       <button id="reconnectBtn" type="button" hidden>Reconnect saved devices</button>
@@ -188,7 +192,7 @@
       <ul class="notes">
         <li>A successful Bluetooth write does not prove the board's microcontroller received the text. Check the board's UART output or the LED.</li>
         <li>You can tap "Connect another BLE device" again while a board is still connecting. The connections run in parallel.</li>
-        <li>"Reconnect saved devices" turns yellow when boards that have connected before are not connected. A board that could not be reached is not counted again until you return to this page or retry it from "Manage devices". A board that never connected is shown as "Never connected": connect it once by hand with "Connect a BLE device" or the Connect button in "Manage devices".</li>
+        <li>"Reconnect saved devices" turns yellow when boards that have connected before are not connected but can be reconnected directly: they were used earlier in this page session, or the page has just heard them advertising. After a page reload the browser has not scanned yet, so the page first listens for a few seconds. Boards it cannot reach directly get a red dot on "Manage devices": open it and tap "Pick from list" for each board. A board that never connected is shown as "Never connected" and is connected the same way.</li>
         <li>This page remembers, on this phone only, which boards have connected and when. Forgetting a board in "Manage devices" also removes it from that memory.</li>
         <li>Leaving Bluefy or locking the phone breaks Bluetooth connections. On iPhone this page then closes them itself so the boards are freed. Come back and tap "Reconnect saved devices" or "Connect a BLE device". The screen is kept awake while connected, if the browser allows it.</li>
         <li>Only one program can hold a connection to a board at a time. Close the Python app before connecting here.</li>
@@ -196,7 +200,7 @@
     </details>
   </section>
 
-  <footer id="version" class="version">TouchBulb BLE Controller, version 1.2</footer>
+  <footer id="version" class="version">TouchBulb BLE Controller, version 1.3</footer>
 </main>
 
 <!-- Boards sheet (opened by "Manage devices") -->
@@ -235,6 +239,7 @@ const DX_CHUNK_DELAY_MS = 40;
 const CONNECT_TIMEOUT_MS = 30000;     // a board just picked from the browser's list
 const RECONNECT_TIMEOUT_MS = 15000;   // a saved board: give up sooner if it is off or out of range
 const SEND_TIMEOUT_MS = 15000;
+const NEARBY_CHECK_MS = 8000;         // how long to listen for boards advertising after a page load
 
 // The browser's own device picker cannot be resized by a page, so keep its list short:
 // only offer devices whose advertised name starts with one of these (case-sensitive).
@@ -253,12 +258,16 @@ let connections = [];         // connected boards: {device, profile, service, ch
 let pending = 0;              // connection attempts in progress (several can run in parallel)
 const attempts = new Map();   // device.id -> {device, cancelled, reason, cancel(reason)}
 // Every board this page knows: boards saved by the browser plus boards picked in this session.
-// device.id -> {device, error, muted, note, forgetArmedAt}
-//   error: why the last attempt failed ('' if it did not fail)
-//   muted: the failed board is not counted by the yellow Reconnect button until the page
-//          returns to the foreground or the board is retried by hand
-//   note:  why an idle board is not connected (lost, background, cancelled)
+// device.id -> {device, error, note, reachable, forgetArmedAt}
+//   error:     why the last attempt failed ('' if it did not fail)
+//   note:      why an idle board is not connected (lost, background, cancelled)
+//   reachable: a direct connect is expected to work. True once the board was picked from the
+//              Bluetooth list or connected in this page session, or was heard advertising.
+//              False after a page (re)load, because the browser has not scanned yet, and
+//              after a failed direct attempt. Such a board must be picked from the list.
 const boards = new Map();
+let nearbyChecking = false;           // listening for advertisements right now
+let nearbyUnsupportedLogged = false;
 // Boards that have fully connected at least once, kept on this phone only:
 // device.id -> {lastConnected: milliseconds since 1970, name}. The browser's saved list
 // also contains boards that were only picked (or failed to connect), so it cannot say this.
@@ -274,7 +283,7 @@ let pumping = false;
 
 const $ = (id) => document.getElementById(id);
 const els = {
-  banner: $('banner'), boardSummary: $('boardSummary'), connectBtn: $('connectBtn'),
+  banner: $('banner'), boardSummary: $('boardSummary'), boardHint: $('boardHint'), connectBtn: $('connectBtn'),
   reconnectBtn: $('reconnectBtn'), manageBtn: $('manageBtn'), attentionDot: $('attentionDot'),
   modeSet: $('modeSet'), slider: $('slider'), sliderValue: $('sliderValue'),
   sendForm: $('sendForm'), textEntry: $('textEntry'), sendBtn: $('sendBtn'),
@@ -398,9 +407,18 @@ function shortReason(err) {
 function getBoard(device) {
   let board = boards.get(device.id);
   if (!board) {
-    board = { device, error: '', muted: false, note: '', forgetArmedAt: 0 };
+    board = { device, error: '', note: '', reachable: false, forgetArmedAt: 0 };
     boards.set(device.id, board);
   }
+  return board;
+}
+
+// A board that was just picked from the Bluetooth list: the picker has scanned for it, so
+// this fresh device record (not an older saved one) is the one that can be connected now.
+function adoptDevice(device) {
+  const board = getBoard(device);
+  board.device = device;
+  board.reachable = true;
   return board;
 }
 
@@ -453,6 +471,75 @@ async function refreshSaved() {
   updateUI();
 }
 
+// After a page (re)load the browser has not scanned yet, so a saved board cannot be connected
+// directly. Where the browser supports it, listen briefly for the boards' advertisements: a
+// board that is heard is in range and can be connected directly. Boards that are not heard
+// have to be picked from the Bluetooth list ("Pick from list").
+async function checkNearby() {
+  if (nearbyChecking) return;
+  const candidates = Array.from(boards.values()).filter((board) =>
+    !board.reachable && ['idle', 'failed'].includes(boardStatus(board)));
+  if (!candidates.length) return;
+  const watchable = candidates.filter((board) => typeof board.device.watchAdvertisements === 'function');
+  if (!watchable.length) {
+    if (!nearbyUnsupportedLogged) {
+      nearbyUnsupportedLogged = true;
+      log('Nearby check not available: this browser cannot listen for advertisements ' +
+          '(watchAdvertisements). After a page reload use "Pick from list".');
+    }
+    updateUI();
+    return;
+  }
+  nearbyChecking = true;
+  updateUI();
+  log('Listening for ' + watchable.length + ' board(s) advertising (up to ' + (NEARBY_CHECK_MS / 1000) + ' s)...');
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), NEARBY_CHECK_MS);
+  try {
+    await Promise.all(watchable.map((board) => listenFor(board, controller.signal)));
+  } finally {
+    clearTimeout(timer);
+    controller.abort();                            // stop the Bluetooth scan
+    nearbyChecking = false;
+    log('Nearby check finished: heard ' + watchable.filter((b) => b.reachable).length +
+        ' of ' + watchable.length + ' board(s).');
+    updateUI();
+  }
+}
+
+// Resolves when this board is heard advertising, or when the listening is aborted or fails.
+function listenFor(board, signal) {
+  return new Promise((resolve) => {
+    const device = board.device;
+    const name = boardName(device);
+    let finished = false;
+    const done = () => {
+      if (finished) return;
+      finished = true;
+      device.removeEventListener('advertisementreceived', onAdvert);
+      signal.removeEventListener('abort', done);
+      resolve();
+    };
+    const onAdvert = () => {
+      board.reachable = true;
+      log('Heard ' + name + ' advertising.');
+      updateUI();
+      done();
+    };
+    device.addEventListener('advertisementreceived', onAdvert);
+    signal.addEventListener('abort', done);
+    try {
+      Promise.resolve(device.watchAdvertisements({ signal })).catch((err) => {
+        log('Could not listen for ' + name + ': ' + ((err && err.name) || 'Error') + ': ' + describeError(err));
+        done();
+      });
+    } catch (err) {
+      log('Could not listen for ' + name + ': ' + ((err && err.name) || 'Error') + ': ' + describeError(err));
+      done();
+    }
+  });
+}
+
 // ---------------------------------------------------------------------------
 // UI state
 // ---------------------------------------------------------------------------
@@ -488,7 +575,10 @@ function buildRow(board, status) {
   } else if (status === 'connecting') {
     actions.append(makeButton('Cancel', () => cancelBoard(board)));
   } else {
-    actions.append(makeButton(status === 'failed' ? 'Retry' : 'Connect', () => connectOne(board), 'primary'));
+    // A board that can be connected directly gets Connect. Otherwise (after a page reload, or
+    // after a failed direct attempt) it must be picked from the Bluetooth list, which scans first.
+    if (board.reachable) actions.append(makeButton('Connect', () => connectOne(board), 'primary'));
+    else actions.append(makeButton('Pick from list', () => pickBoard(board), 'primary'));
     if (typeof board.device.forget === 'function') {
       const armed = board.forgetArmedAt && Date.now() - board.forgetArmedAt < 4000;
       actions.append(makeButton(armed ? 'Tap again to forget' : 'Forget', () => forgetClicked(board)));
@@ -524,20 +614,35 @@ function updateUI() {
   els.connectBtn.disabled = !navigator.bluetooth;
   els.connectBtn.textContent = (connected || pending > 0) ? 'Connect another BLE device' : 'Connect a BLE device';
 
-  // Yellow only when there is something to reconnect that is worth trying now.
-  // Only boards that have connected before are counted. A board that failed is skipped
-  // (muted) until you return to the page or retry it by hand.
+  // Boards that are not connected and not connecting.
+  const waiting = (i) => statuses[i] === 'idle' || statuses[i] === 'failed';
+  // Yellow: boards that connected before AND can be connected directly right now (used in this
+  // page session, or heard advertising). Boards that connected before but cannot be connected
+  // directly need a pick from the Bluetooth list: that is what the red dot and hint are for.
   const reconnectable = all.filter((board, i) =>
-    (statuses[i] === 'idle' || statuses[i] === 'failed') &&
-    hasConnectedBefore(board.device) && !board.muted).length;
+    waiting(i) && hasConnectedBefore(board.device) && board.reachable).length;
+  const needPick = all.filter((board, i) =>
+    waiting(i) && hasConnectedBefore(board.device) && !board.reachable).length;
   els.reconnectBtn.disabled = !navigator.bluetooth || reconnectable === 0;
   els.reconnectBtn.textContent = reconnectable > 0
     ? 'Reconnect saved devices (' + reconnectable + ')' : 'Reconnect saved devices';
   els.reconnectBtn.classList.toggle('ready', reconnectable > 0);
 
-  els.attentionDot.hidden = !statuses.includes('failed');
+  // Red dot: a board failed, or a board that connected before needs a pick (once the
+  // listening for advertisements has finished, so it does not flash during the check).
+  els.attentionDot.hidden = !(statuses.includes('failed') || (!nearbyChecking && needPick > 0));
+  let hint = '';
+  if (nearbyChecking) hint = 'Looking for your boards...';
+  else if (needPick > 0) {
+    hint = (needPick === 1 ? '1 board needs' : needPick + ' boards need') +
+           ' to be selected from the Bluetooth list. Tap "Manage devices".';
+  }
+  els.boardHint.textContent = hint;
+  els.boardHint.hidden = !hint;
+  els.boardHint.classList.toggle('attention', !nearbyChecking && needPick > 0);
+
   els.boardSummary.textContent = summaryText(all);
-  els.connectAllBtn.disabled = !(statuses.includes('idle') || statuses.includes('failed'));
+  els.connectAllBtn.disabled = !all.some((board, i) => waiting(i) && board.reachable);
   els.disconnectAllBtn.disabled = !(connected || attempts.size > 0);
 
   els.slider.disabled = !connected;
@@ -705,15 +810,18 @@ async function setupConnection(device, timeoutMs) {
   }
 }
 
-// Let the user pick a board from the browser's own list, then connect to it.
-async function connectDevice() {
+// Let the user pick a board from the browser's own list, then connect to it. With a `target`
+// board (the "Pick from list" button) the list is narrowed to that board's name.
+async function pickAndConnect(target) {
   if (!navigator.bluetooth) { setStatus('This browser does not support Web Bluetooth.', 'error'); return; }
 
   // requestDevice() must run straight from the tap (user activation) - no awaits before it.
   // Read the checkbox synchronously, before any await.
   const filtered = !els.showAll.checked;
+  const targetName = target && target.device.name;
   const options = { optionalServices: [CODELESS_SERVICE, DX_SERVICE] };
-  if (filtered) options.filters = NAME_PREFIXES.map((namePrefix) => ({ namePrefix }));
+  if (targetName) options.filters = [{ name: targetName }];
+  else if (filtered) options.filters = NAME_PREFIXES.map((namePrefix) => ({ namePrefix }));
   else options.acceptAllDevices = true;
 
   let device;
@@ -721,10 +829,15 @@ async function connectDevice() {
     device = await navigator.bluetooth.requestDevice(options);
   } catch (err) {
     if (err && err.name === 'NotFoundError') {
-      setStatus(filtered
-        ? 'No device was selected. If your board was not listed, open "Activity log and advanced settings", ' +
-          'tick "Show all nearby devices" and try again.'
-        : 'No device was selected.');
+      if (targetName) {
+        setStatus('No board was selected. If "' + targetName + '" was not listed, check that it is ' +
+                  'switched on and nearby, or use "Connect a BLE device" with "Show all nearby devices".');
+      } else {
+        setStatus(filtered
+          ? 'No device was selected. If your board was not listed, open "Activity log and advanced settings", ' +
+            'tick "Show all nearby devices" and try again.'
+          : 'No device was selected.');
+      }
       return;
     }
     setStatus(friendlyError(err, 'Device selection'), 'error');
@@ -737,11 +850,18 @@ async function connectDevice() {
     updateUI();
     return;
   }
+  const board = adoptDevice(device);               // the freshly picked record is the one that works
+  if (target && board !== target) {
+    log('Picked ' + boardName(device) + ' instead of ' + boardName(target.device) + '.');
+  }
 
   // The tap handler does not wait for this, so "Connect" can be tapped again to pick the
   // next board while this one is still connecting: the connections then run in parallel.
   return startConnect(device);
 }
+
+function connectDevice() { return pickAndConnect(null); }
+function pickBoard(board) { return pickAndConnect(board); }
 
 // Connect one device and add it to the list. Resolves true on success, false otherwise.
 // Safe to run for several devices at the same time. Options:
@@ -755,7 +875,6 @@ async function startConnect(device, options) {
   const board = getBoard(device);
   board.error = '';
   board.note = '';
-  board.muted = false;
 
   // `cancel` ends the attempt at once (user pressed Cancel, or the page left the foreground),
   // even if the browser is still waiting for the board.
@@ -787,6 +906,7 @@ async function startConnect(device, options) {
     connections.push(conn);
     if (first) resetControls();
     markConnected(device);                      // remember that this board works
+    board.reachable = true;                     // it can be reconnected directly in this page session
     log('Connected: ' + conn.name + ' (' + conn.profile + ')');
     const others = pending - 1;                 // this attempt is still counted in `pending`
     setStatus('Connected to ' + conn.name + ' (' + conn.profile + ')' +
@@ -801,7 +921,7 @@ async function startConnect(device, options) {
       return false;
     }
     board.error = shortReason(err);
-    board.muted = true;                         // not counted by the yellow button until you return or retry
+    board.reachable = false;                    // direct connecting did not work: pick it from the list
     const stepText = err && err.stage ? ' (step: ' + err.stage + ')' : '';
     log('Connection failed for ' + name + stepText + ': ' + ((err && err.name) || 'Error') + ': ' + describeError(err));
     if (!quiet) {
@@ -816,7 +936,7 @@ async function startConnect(device, options) {
   }
 }
 
-// Retry one saved board from the Boards sheet.
+// Connect one board directly (only offered for boards that are expected to be reachable).
 async function connectOne(board) {
   const status = boardStatus(board);
   if (status === 'connected' || status === 'connecting') return;
@@ -851,22 +971,30 @@ async function connectBoards(targets, emptyMessage) {
   }
 }
 
-// The yellow button: boards that have connected before, are not connected now, and have
-// not just failed. Boards never connected are left alone: connect them once by hand.
+// The yellow button: boards that connected before, are not connected now, and can be
+// connected directly (used in this page session, or heard advertising).
 async function reconnectSaved() {
   await refreshSaved();
   const targets = Array.from(boards.values()).filter((b) =>
-    ['idle', 'failed'].includes(boardStatus(b)) && hasConnectedBefore(b.device) && !b.muted);
+    ['idle', 'failed'].includes(boardStatus(b)) && hasConnectedBefore(b.device) && b.reachable);
   await connectBoards(targets,
-    'No board that connected before is waiting to be reconnected. ' +
-    'Connect a new board once with "Connect a BLE device" or from "Manage devices".');
+    'No board that connected before can be reconnected directly right now. ' +
+    'Open "Manage devices" and tap "Pick from list".');
 }
 
-// "Connect all" in the Boards sheet: every board that is not connected, including failed ones.
+// "Connect all" in the Boards sheet: every board that is not connected and can be connected
+// directly. The others need "Pick from list" (the browser's list takes one board per tap).
 async function connectAll() {
   await refreshSaved();
-  const targets = Array.from(boards.values()).filter((b) => ['idle', 'failed'].includes(boardStatus(b)));
-  await connectBoards(targets, 'All boards are already connected or connecting.');
+  const waiting = Array.from(boards.values()).filter((b) => ['idle', 'failed'].includes(boardStatus(b)));
+  const targets = waiting.filter((b) => b.reachable);
+  const skipped = waiting.length - targets.length;
+  await connectBoards(targets, waiting.length === 0
+    ? 'All boards are already connected or connecting.'
+    : 'No board can be connected directly right now. Use "Pick from list" on each board.');
+  if (targets.length && skipped > 0) {
+    els.status.textContent += ' ' + skipped + ' other board(s) need "Pick from list".';
+  }
 }
 
 function forgetClicked(board) {
@@ -1007,10 +1135,9 @@ function onBackInForeground() {
       log('Dropped a connection that was lost in the background: ' + conn.name);
     }
   }
-  // Boards that failed earlier get another chance to light up the yellow button.
-  for (const board of boards.values()) board.muted = false;
   updateUI();
-  refreshSaved();
+  // Boards that could not be reached directly get another chance: listen for them again.
+  refreshSaved().then(checkNearby);
 }
 
 document.addEventListener('visibilitychange', () => {
@@ -1227,7 +1354,7 @@ if (!navigator.bluetooth) {
 updateUI();
 if (navigator.bluetooth && typeof navigator.bluetooth.getDevices === 'function') {
   els.reconnectBtn.hidden = false;               // only offered where the browser supports it
-  refreshSaved();                                // list the boards the browser already knows
+  refreshSaved().then(checkNearby);              // list the boards the browser knows, then listen for them
 }
 </script>
 </body>
