@@ -61,10 +61,10 @@
   }
   .optionrow input { width: 22px; height: 22px; flex: none; margin: 0; }
   .none { color: var(--muted); }
-  fieldset { border: 1px solid var(--border); border-radius: 10px; margin: 0; padding: 8px 12px; }
+  fieldset { border: 1px solid var(--border); border-radius: 10px; margin: 14px 0 0; padding: 8px 12px; }
   legend { padding: 0 6px; color: var(--muted); font-size: 0.9rem; }
   fieldset label { display: inline-flex; align-items: center; gap: 6px; margin-right: 18px; min-height: 36px; }
-  .sliderbox { margin-top: 14px; }
+  .sliderbox { margin-top: 0; }
   .sliderhead { display: flex; justify-content: space-between; align-items: baseline; }
   #sliderValue { font-size: 1.6rem; font-weight: 600; min-width: 1.5ch; text-align: right; }
   input[type=range] { width: 100%; height: 44px; accent-color: var(--accent); }
@@ -86,22 +86,29 @@
   ul.notes { margin: 8px 0 0; padding-left: 20px; color: var(--muted); font-size: 0.9rem; }
   .version { text-align: center; color: var(--muted); font-size: 0.8rem; padding: 4px 0 8px; }
 
-  /* Boards sheet: slides over the page, the list scrolls inside it */
-  .sheet { position: fixed; inset: 0; z-index: 10; display: flex; align-items: flex-end; justify-content: center; }
+  /* Boards sheet: a panel at the TOP of the visible screen; the list scrolls inside it.
+     --app-height is set by the script to the height that is really visible (on iPhone the
+     browser's own toolbars hide part of the screen, and 100vh does not account for them). */
+  :root { --app-height: 100vh; }
+  .sheet {
+    position: fixed; top: 0; left: 0; right: 0; height: var(--app-height); z-index: 10;
+    display: flex; align-items: flex-start; justify-content: center;
+  }
   .sheet[hidden] { display: none; }
-  .backdrop { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.5); }
+  .backdrop { position: absolute; inset: 0; background: rgba(0, 0, 0, 0.5); touch-action: none; }
   .panel {
-    position: relative; width: 100%; max-width: 640px;
-    max-height: 80vh; max-height: 80dvh;
+    position: relative; width: calc(100% - 16px); max-width: 640px;
+    margin-top: calc(8px + env(safe-area-inset-top));
+    max-height: calc(var(--app-height) - 16px - env(safe-area-inset-top));
     display: flex; flex-direction: column;
     background: var(--card); color: var(--text);
-    border: 1px solid var(--border); border-bottom: 0; border-radius: 16px 16px 0 0;
-    padding: 14px 14px calc(14px + env(safe-area-inset-bottom));
+    border: 1px solid var(--border); border-radius: 16px;
+    padding: 14px;
   }
   .panelhead { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
   .panelhead h2 { margin: 0; font-size: 1.1rem; }
   .panelactions { margin-bottom: 8px; }
-  .boardlist { overflow-y: auto; -webkit-overflow-scrolling: touch; flex: 1; min-height: 0; }
+  .boardlist { overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain; flex: 1; min-height: 0; }
   .board {
     display: flex; justify-content: space-between; align-items: center; gap: 10px;
     padding: 10px 0; border-top: 1px solid var(--border);
@@ -137,12 +144,6 @@
   <section aria-labelledby="ctlHead">
     <h2 id="ctlHead">Controls</h2>
 
-    <fieldset id="modeSet">
-      <legend>Operation mode</legend>
-      <label><input type="radio" name="mode" value="L" checked> Latched</label>
-      <label><input type="radio" name="mode" value="M"> Momentary</label>
-    </fieldset>
-
     <div class="sliderbox">
       <div class="sliderhead">
         <label for="slider">Slide to send a digit (0&ndash;9)</label>
@@ -154,6 +155,12 @@
         <span>5</span><span>6</span><span>7</span><span>8</span><span>9</span>
       </div>
     </div>
+
+    <fieldset id="modeSet">
+      <legend>Operation mode</legend>
+      <label><input type="radio" name="mode" value="L" checked> Latched</label>
+      <label><input type="radio" name="mode" value="M"> Momentary</label>
+    </fieldset>
 
     <form id="sendForm" class="sendrow">
       <input id="textEntry" type="text" autocomplete="off" autocapitalize="off"
@@ -189,7 +196,7 @@
     </details>
   </section>
 
-  <footer id="version" class="version">TouchBulb BLE Controller, version 1.1</footer>
+  <footer id="version" class="version">TouchBulb BLE Controller, version 1.2</footer>
 </main>
 
 <!-- Boards sheet (opened by "Manage devices") -->
@@ -558,7 +565,17 @@ function resetControls() {
 // ---------------------------------------------------------------------------
 // Boards sheet
 // ---------------------------------------------------------------------------
+// Size the panel to what is really visible. On iPhone the browser's toolbars cover part of
+// the screen, so a bottom-anchored panel sized in vh ends up partly hidden.
+function updateAppHeight() {
+  const vv = window.visualViewport;
+  const height = (vv && vv.height) || window.innerHeight;
+  if (!height || !document.documentElement) return;
+  document.documentElement.style.setProperty('--app-height', Math.round(height) + 'px');
+}
+
 function openSheet() {
+  updateAppHeight();
   renderBoards();
   els.sheet.hidden = false;
   document.body.classList.add('sheet-open');
@@ -1178,6 +1195,11 @@ els.disconnectAllBtn.addEventListener('click', disconnectAll);
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && !els.sheet.hidden) closeSheet();
 });
+// Keep the panel sized to the visible area when the toolbars show/hide or the phone rotates.
+window.addEventListener('resize', updateAppHeight);
+window.addEventListener('orientationchange', updateAppHeight);
+if (window.visualViewport) window.visualViewport.addEventListener('resize', updateAppHeight);
+updateAppHeight();
 
 // "Show all nearby devices" is remembered on this device.
 els.showAll.checked = loadSetting(SETTING_SHOW_ALL) === '1';

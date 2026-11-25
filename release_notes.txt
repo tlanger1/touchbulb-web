@@ -1,0 +1,26 @@
+TouchBulb BLE Controller - release notes
+========================================
+Upload index.html and release_notes.txt together to the same GitHub folder.
+The version number is also shown at the bottom of the page, so you can see
+whether the phone loaded the new file.
+
+Version 1.2 - 2026-11-25
+- The "Manage devices" panel now opens at the top of the visible screen and is
+  sized to what you can actually see, instead of hanging from the bottom edge
+  (where part of it was hidden on iPhone SE). The board list scrolls inside it.
+- In the Controls section the slider is now above "Operation mode".
+
+Version 1.1 - 2026-11-25
+- "Reconnect saved devices" (the yellow button) now counts and reconnects only
+  boards that have connected successfully before. Boards that were only picked,
+  or never connected, no longer light it up after a reload or fail when tapped.
+- The page now remembers, on this phone only, which boards have connected and
+  when. Forgetting a board in "Manage devices" also removes it from this memory.
+- "Manage devices" shows "Never connected" or "Last connected ... ago" for each
+  board, and the summary line counts never-connected boards separately.
+- "Connect all" and each board's Connect button still try every board, so a
+  first connection remains one tap.
+- The page version is now shown at the bottom of the page.
+
+Version 1.0 - the version that was online before this file existed
+(no notes kept).
