@@ -47,6 +47,7 @@
   button.ready {
     background: var(--ready); color: var(--ready-text); border-color: var(--ready-border); font-weight: 600;
   }
+  button.danger { color: var(--danger); border-color: var(--danger); }
   button:disabled { opacity: 0.45; cursor: not-allowed; }
   .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
   .summary { color: var(--text); overflow-wrap: anywhere; }
@@ -194,13 +195,14 @@
         <li>You can tap "Connect another BLE device" again while a board is still connecting. The connections run in parallel.</li>
         <li>"Reconnect saved devices" turns yellow when boards that have connected before are not connected but can be reconnected directly: they were used earlier in this page session, or the page has just heard them advertising. After a page reload the browser has not scanned yet, so the page first listens for a few seconds. Boards it cannot reach directly get a red dot on "Manage devices": open it and tap "Pick from list" for each board. A board that never connected is shown as "Never connected" and is connected the same way.</li>
         <li>This page remembers, on this phone only, which boards have connected and when. Forgetting a board in "Manage devices" also removes it from that memory.</li>
+        <li>"Clear list" in "Manage devices" (two taps) starts from scratch: it disconnects everything, forgets the saved boards (or hides them on this page if the browser cannot forget them), clears the memory above and turns "Show all nearby devices" off. A hidden board comes back when you pick it from the Bluetooth list.</li>
         <li>Leaving Bluefy or locking the phone breaks Bluetooth connections. On iPhone this page then closes them itself so the boards are freed. Come back and tap "Reconnect saved devices" or "Connect a BLE device". The screen is kept awake while connected, if the browser allows it.</li>
         <li>Only one program can hold a connection to a board at a time. Close the Python app before connecting here.</li>
       </ul>
     </details>
   </section>
 
-  <footer id="version" class="version">TouchBulb BLE Controller, version 1.3</footer>
+  <footer id="version" class="version">TouchBulb BLE Controller, version 1.4</footer>
 </main>
 
 <!-- Boards sheet (opened by "Manage devices") -->
@@ -214,6 +216,7 @@
     <div class="row panelactions">
       <button id="connectAllBtn" type="button">Connect all</button>
       <button id="disconnectAllBtn" type="button">Disconnect all</button>
+      <button id="clearListBtn" type="button" class="danger">Clear list</button>
     </div>
     <div id="boardList" class="boardlist"></div>
   </div>
@@ -248,6 +251,7 @@ const NAME_PREFIXES = ['BT24', 'DX-BT24', 'Touch'];
 
 const SETTING_SHOW_ALL = 'touchbulb.showAll';
 const SETTING_CONNECTED_BEFORE = 'touchbulb.connectedBefore';
+const SETTING_HIDDEN = 'touchbulb.hidden';
 const BACKGROUND_NOTE = 'Disconnected when the page left the foreground.';
 const LOST_NOTE = 'The connection was lost.';
 
@@ -272,6 +276,10 @@ let nearbyUnsupportedLogged = false;
 // device.id -> {lastConnected: milliseconds since 1970, name}. The browser's saved list
 // also contains boards that were only picked (or failed to connect), so it cannot say this.
 let connectedBefore = loadConnectedBefore();
+// Boards cleared with "Clear list" in a browser that cannot forget saved devices. The browser
+// still lists them, so the page keeps their ids and leaves them out until they are picked again.
+let hiddenIds = loadHiddenIds();
+let clearArmedAt = 0;         // "Clear list" needs a second tap within 4 seconds
 let releasedDevices = [];     // {device, name} closed because the page left the foreground
 let wakeLock = null;
 let wakeLockBusy = false;
@@ -290,7 +298,7 @@ const els = {
   status: $('status'), log: $('log'), logReplies: $('logReplies'), showAll: $('showAll'),
   logDetails: $('logDetails'), sheet: $('sheet'), sheetBackdrop: $('sheetBackdrop'),
   sheetClose: $('sheetClose'), connectAllBtn: $('connectAllBtn'),
-  disconnectAllBtn: $('disconnectAllBtn'), boardList: $('boardList'),
+  disconnectAllBtn: $('disconnectAllBtn'), clearListBtn: $('clearListBtn'), boardList: $('boardList'),
 };
 
 // ---------------------------------------------------------------------------
@@ -362,6 +370,20 @@ function forgetConnectedBefore(device) {
   saveSetting(SETTING_CONNECTED_BEFORE, JSON.stringify(connectedBefore));
 }
 
+function loadHiddenIds() {
+  try {
+    const raw = loadSetting(SETTING_HIDDEN);
+    const data = raw ? JSON.parse(raw) : [];
+    return new Set(Array.isArray(data) ? data.filter((id) => typeof id === 'string') : []);
+  } catch (_) {
+    return new Set();
+  }
+}
+
+function saveHiddenIds() {
+  saveSetting(SETTING_HIDDEN, JSON.stringify(Array.from(hiddenIds)));
+}
+
 function timeAgo(ms) {
   const seconds = Math.max(0, Math.round((Date.now() - ms) / 1000));
   if (seconds < 60) return 'just now';
@@ -419,6 +441,7 @@ function adoptDevice(device) {
   const board = getBoard(device);
   board.device = device;
   board.reachable = true;
+  if (hiddenIds.delete(device.id)) saveHiddenIds();      // picking a cleared board brings it back
   return board;
 }
 
@@ -464,7 +487,9 @@ async function refreshSaved() {
   if (!navigator.bluetooth || typeof navigator.bluetooth.getDevices !== 'function') return;
   try {
     const saved = await navigator.bluetooth.getDevices();
-    for (const device of saved) getBoard(device);
+    for (const device of saved) {
+      if (!hiddenIds.has(device.id)) getBoard(device);   // boards cleared from the list stay out
+    }
   } catch (err) {
     log('Saved device list not available: ' + describeError(err));
   }
@@ -644,6 +669,12 @@ function updateUI() {
   els.boardSummary.textContent = summaryText(all);
   els.connectAllBtn.disabled = !all.some((board, i) => waiting(i) && board.reachable);
   els.disconnectAllBtn.disabled = !(connected || attempts.size > 0);
+
+  // "Clear list": needs something to clear; after one tap it asks for a second tap.
+  const clearArmed = clearArmedAt && Date.now() - clearArmedAt < 4000;
+  els.clearListBtn.disabled = all.length === 0 && Object.keys(connectedBefore).length === 0;
+  els.clearListBtn.textContent = !clearArmed ? 'Clear list'
+    : (all.length ? 'Tap again to clear all ' + all.length + (all.length === 1 ? ' board' : ' boards') : 'Tap again to clear');
 
   els.slider.disabled = !connected;
   els.textEntry.disabled = !connected;
@@ -1025,6 +1056,68 @@ async function forgetBoard(board) {
   updateUI();
 }
 
+// "Clear list": start from scratch. First tap arms it, a second tap within 4 s does it.
+function clearListClicked() {
+  if (clearArmedAt && Date.now() - clearArmedAt < 4000) {
+    clearList();
+    return;
+  }
+  clearArmedAt = Date.now();
+  updateUI();
+  setTimeout(() => {
+    if (clearArmedAt) { clearArmedAt = 0; updateUI(); }
+  }, 4000);
+}
+
+// Disconnects everything, forgets every saved board (or hides it on this page if the browser
+// cannot forget saved devices), clears the memory of boards that connected before, and turns
+// "Show all nearby devices" off.
+async function clearList() {
+  clearArmedAt = 0;
+  const all = Array.from(boards.values());
+
+  // 1. Stop everything: a connected board cannot stay on a list that is being cleared.
+  sendQueue.length = 0;
+  for (const attempt of Array.from(attempts.values())) attempt.cancel('by you');
+  for (const conn of connections.slice()) disconnectConnection(conn);
+
+  // 2. Forget the saved boards, or hide the ones the browser cannot forget.
+  let hidden = 0;
+  await Promise.all(all.map(async (board) => {
+    let forgotten = false;
+    if (typeof board.device.forget === 'function') {
+      try {
+        await board.device.forget();
+        forgotten = true;
+      } catch (err) {
+        log('Could not forget ' + boardName(board.device) + ': ' + describeError(err));
+      }
+    }
+    if (!forgotten) { hiddenIds.add(board.device.id); hidden++; }
+  }));
+  saveHiddenIds();
+
+  // 3. Forget what this page remembers, and reset the settings.
+  boards.clear();
+  releasedDevices = [];
+  connectedBefore = {};
+  saveSetting(SETTING_CONNECTED_BEFORE, '{}');
+  els.showAll.checked = false;
+  saveSetting(SETTING_SHOW_ALL, '0');
+  resetControls();
+
+  log('List cleared: ' + all.length + ' board(s)' + (hidden ? ', ' + hidden + ' hidden on this page' : '') + '.');
+  let message = all.length
+    ? 'Cleared ' + all.length + (all.length === 1 ? ' board' : ' boards') + '.'
+    : 'Cleared what this page remembered.';
+  if (hidden) {
+    message += ' This browser cannot forget saved devices, so ' + hidden + (hidden === 1 ? ' board is' : ' boards are') +
+               ' hidden on this page. A board comes back when you pick it from the Bluetooth list.';
+  }
+  setStatus(message + ' Start again with "Connect a BLE device".');
+  updateUI();
+}
+
 function removeConnection(conn) {
   const before = connections.length;
   connections = connections.filter((c) => c !== conn);
@@ -1319,6 +1412,7 @@ els.sheetClose.addEventListener('click', closeSheet);
 els.sheetBackdrop.addEventListener('click', closeSheet);
 els.connectAllBtn.addEventListener('click', connectAll);
 els.disconnectAllBtn.addEventListener('click', disconnectAll);
+els.clearListBtn.addEventListener('click', clearListClicked);
 document.addEventListener('keydown', (event) => {
   if (event.key === 'Escape' && !els.sheet.hidden) closeSheet();
 });
