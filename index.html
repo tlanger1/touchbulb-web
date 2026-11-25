@@ -95,6 +95,7 @@
     <div id="deviceList"><span class="none">(none)</span></div>
     <div class="row" style="margin-top:12px">
       <button id="connectBtn" class="primary" type="button">Connect a BLE device</button>
+      <button id="reconnectBtn" type="button" hidden>Reconnect saved devices</button>
       <button id="disconnectAllBtn" type="button">Disconnect all</button>
     </div>
     <label class="showall">
@@ -145,7 +146,8 @@
       <pre id="log" aria-label="Activity log"></pre>
       <ul class="notes">
         <li>A successful Bluetooth write does not prove the board's microcontroller received the text. Check the board's UART output or the LED.</li>
-        <li>Keep the screen on and this page in the foreground. Locking the phone or switching apps can drop the connection.</li>
+        <li>You can tap "Connect another BLE device" again while a board is still connecting. The connections run in parallel.</li>
+        <li>Leaving Bluefy or locking the phone breaks Bluetooth connections. On iPhone this page then closes them itself so the boards are freed. Come back and tap "Connect a BLE device" (or "Reconnect saved devices" if it is shown). The screen is kept awake while connected, if the browser allows it.</li>
         <li>Only one program can hold a connection to a board at a time. Close the Python app before connecting here.</li>
       </ul>
     </details>
@@ -181,7 +183,12 @@ const NAME_PREFIXES = ['BT24', 'DX-BT24', 'Touch'];
 // State
 // ---------------------------------------------------------------------------
 let connections = [];   // {device, profile, service, characteristic, name, closing}
-let busy = false;       // true while connecting or disconnecting
+let pending = 0;        // connection attempts in progress (several can run in parallel)
+const attempts = new Map();   // device.id -> {device, cancelled}
+let releasedDevices = [];     // {device, name} closed because the page left the foreground
+let wakeLock = null;
+let wakeLockBusy = false;
+let wakeLockUnavailable = false;
 let mode = 'L';
 let lastSlider = 0;
 const sendQueue = [];   // FIFO of strings, one command at a time (like the Python app)
@@ -193,7 +200,7 @@ const els = {
   disconnectAllBtn: $('disconnectAllBtn'), modeSet: $('modeSet'), slider: $('slider'),
   sliderValue: $('sliderValue'), sendForm: $('sendForm'), textEntry: $('textEntry'),
   sendBtn: $('sendBtn'), status: $('status'), log: $('log'), logReplies: $('logReplies'),
-  showAll: $('showAll'), logDetails: $('logDetails'),
+  showAll: $('showAll'), logDetails: $('logDetails'), reconnectBtn: $('reconnectBtn'),
 };
 
 // ---------------------------------------------------------------------------
@@ -249,7 +256,7 @@ function friendlyError(err, stage) {
 // ---------------------------------------------------------------------------
 function renderDevices() {
   els.deviceList.textContent = '';
-  if (!connections.length) {
+  if (!connections.length && !attempts.size) {
     const none = document.createElement('span');
     none.className = 'none';
     none.textContent = '(none)';
@@ -270,24 +277,40 @@ function renderDevices() {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.textContent = 'Disconnect';
-    btn.disabled = busy;
+    btn.disabled = pending > 0;
     btn.addEventListener('click', () => disconnectOne(conn));
     row.append(label, btn);
+    els.deviceList.appendChild(row);
+  }
+  for (const attempt of attempts.values()) {     // boards that are still connecting
+    const row = document.createElement('div');
+    row.className = 'device';
+    const label = document.createElement('div');
+    const name = document.createElement('div');
+    name.className = 'name';
+    name.textContent = attempt.device.name || attempt.device.id;
+    const state = document.createElement('div');
+    state.className = 'profile';
+    state.textContent = 'Connecting...';
+    label.append(name, state);
+    row.append(label);
     els.deviceList.appendChild(row);
   }
 }
 
 function updateUI() {
   const connected = connections.length > 0;
-  const usable = connected && !busy;
-  els.connectBtn.disabled = busy || !navigator.bluetooth;
-  els.connectBtn.textContent = connected ? 'Connect another BLE device' : 'Connect a BLE device';
-  els.disconnectAllBtn.disabled = !usable;
-  els.slider.disabled = !usable;
-  els.textEntry.disabled = !usable;
-  els.sendBtn.disabled = !usable;
-  for (const radio of els.modeSet.querySelectorAll('input')) radio.disabled = !usable;
+  // Connect stays enabled while boards are connecting, so the next one can be picked at once.
+  els.connectBtn.disabled = !navigator.bluetooth;
+  els.connectBtn.textContent = (connected || pending > 0) ? 'Connect another BLE device' : 'Connect a BLE device';
+  els.reconnectBtn.disabled = !navigator.bluetooth;
+  els.disconnectAllBtn.disabled = !(connected && pending === 0);
+  els.slider.disabled = !connected;
+  els.textEntry.disabled = !connected;
+  els.sendBtn.disabled = !connected;
+  for (const radio of els.modeSet.querySelectorAll('input')) radio.disabled = !connected;
   renderDevices();
+  updateWakeLock();
 }
 
 // Set mode radio + variable WITHOUT transmitting anything.
@@ -422,7 +445,6 @@ async function setupConnection(device) {
 }
 
 async function connectDevice() {
-  if (busy) return;
   if (!navigator.bluetooth) { setStatus('This browser does not support Web Bluetooth.', 'error'); return; }
 
   // requestDevice() must run straight from the tap (user activation) - no awaits before it.
@@ -446,30 +468,86 @@ async function connectDevice() {
     return;
   }
 
-  if (connections.some((c) => c.device.id === device.id)) {
-    setStatus('That device is already connected.');
+  if (connections.some((c) => c.device.id === device.id) || attempts.has(device.id)) {
+    setStatus('That device is already connected (or connecting).');
     return;
   }
 
-  busy = true;
+  // The tap handler does not wait for this, so "Connect" can be tapped again to pick the
+  // next board while this one is still connecting: the connections then run in parallel.
+  return startConnect(device);
+}
+
+// Connect one device and add it to the list. Resolves true on success, false otherwise.
+// Safe to run for several devices at the same time.
+async function startConnect(device) {
+  const name = device.name || device.id;
+  const attempt = { device, cancelled: false };
+  attempts.set(device.id, attempt);
+  pending++;
   updateUI();
-  setStatus('Connecting to ' + (device.name || device.id) + '...');
+  setStatus('Connecting to ' + name + (pending > 1 ? ' (' + pending + ' connections in progress)' : '') + '...');
   try {
     const conn = await setupConnection(device);
+    if (attempt.cancelled) {
+      releaseDevice(device, name);
+      log('Connection to ' + name + ' cancelled because the page left the foreground.');
+      return false;
+    }
     const first = connections.length === 0;
     connections.push(conn);
     if (first) resetControls();
     log('Connected: ' + conn.name + ' (' + conn.profile + ')');
-    setStatus('Connected to ' + conn.name + ' (' + conn.profile + '), no pairing needed.', 'ok');
+    const others = pending - 1;                 // this attempt is still counted in `pending`
+    setStatus('Connected to ' + conn.name + ' (' + conn.profile + ')' +
+              (others > 0 ? '; ' + others + ' more connecting...' : ', no pairing needed.'), 'ok');
+    return true;
   } catch (err) {
-    try { if (device.gatt.connected) device.gatt.disconnect(); } catch (_) { /* ignore */ }
+    releaseDevice(device, name);
+    if (attempt.cancelled) {
+      log('Connection to ' + name + ' cancelled because the page left the foreground.');
+      return false;
+    }
     const stepText = err && err.stage ? ' (step: ' + err.stage + ')' : '';
     log('Connection failed' + stepText + ': ' + ((err && err.name) || 'Error') + ': ' + describeError(err));
     setStatus(friendlyError(err, 'Pairing / connection') + stepText, 'error');
     els.logDetails.open = true;     // show the log so the cause can be read on the phone
+    return false;
   } finally {
-    busy = false;
+    attempts.delete(device.id);
+    pending--;
     updateUI();
+  }
+}
+
+// Boards the browser already knows from earlier picks, reconnected in parallel with one tap.
+// Only offered if the browser supports navigator.bluetooth.getDevices().
+const matchesPrefix = (name) => !!name && NAME_PREFIXES.some((prefix) => name.startsWith(prefix));
+
+async function reconnectSaved() {
+  if (!navigator.bluetooth || typeof navigator.bluetooth.getDevices !== 'function') return;
+  let devices;
+  try {
+    devices = await navigator.bluetooth.getDevices();
+  } catch (err) {
+    setStatus(friendlyError(err, 'Listing saved devices'), 'error');
+    return;
+  }
+  const showAll = els.showAll.checked;
+  const wanted = devices.filter((d) => (showAll || matchesPrefix(d.name)) &&
+    !connections.some((c) => c.device.id === d.id) && !attempts.has(d.id));
+  if (!wanted.length) {
+    setStatus('No saved devices to reconnect. Connect each board once with "Connect a BLE device" first. ' +
+              'Tick "Show all nearby devices" if a saved board has a different name.');
+    return;
+  }
+  log('Reconnecting ' + wanted.length + ' saved device(s) in parallel');
+  const results = await Promise.allSettled(wanted.map((device) => startConnect(device)));
+  const ok = results.filter((r) => r.status === 'fulfilled' && r.value === true).length;
+  if (ok === wanted.length) {
+    setStatus('Reconnected ' + ok + ' device(s).', 'ok');
+  } else {
+    setStatus('Reconnected ' + ok + ' of ' + wanted.length + ' device(s). See the activity log for the others.', 'error');
   }
 }
 
@@ -492,16 +570,25 @@ function onDisconnected(conn) {
   updateUI();
 }
 
+// Always ask the browser to close the link, even if it already reports it as closed. That
+// frees the board in Bluefy's own bookkeeping, so it is not left listed as "paired" and
+// untappable in the device picker.
+function releaseDevice(device, name) {
+  try {
+    device.gatt.disconnect();
+  } catch (err) {
+    log('Disconnect error for ' + (name || device.id) + ': ' + describeError(err));
+  }
+}
+
 function disconnectConnection(conn) {
   conn.closing = true;
-  try { if (conn.device.gatt.connected) conn.device.gatt.disconnect(); } catch (err) {
-    log('Disconnect error for ' + conn.name + ': ' + ((err && err.message) || err));
-  }
+  releaseDevice(conn.device, conn.name);
   removeConnection(conn);
 }
 
 function disconnectOne(conn) {
-  if (busy || !connections.includes(conn)) return;
+  if (pending > 0 || !connections.includes(conn)) return;
   disconnectConnection(conn);
   log('Disconnected: ' + conn.name);
   if (!connections.length) {
@@ -514,12 +601,97 @@ function disconnectOne(conn) {
 }
 
 function disconnectAll() {
-  if (busy) return;
+  if (pending > 0) return;
   sendQueue.length = 0;                        // discard queued digits
   for (const conn of connections.slice()) disconnectConnection(conn);
   log('Disconnected all devices');
   setStatus('Disconnected.');
   updateUI();
+}
+
+// ---------------------------------------------------------------------------
+// Leaving the foreground (iPhone)
+// ---------------------------------------------------------------------------
+// iOS suspends a page that leaves the foreground and silently drops its Bluetooth links.
+// Bluefy can then keep listing the board as "paired" but not tappable, until Bluefy is
+// restarted. So on iPhone/iPad the page closes its own connections as it goes to the
+// background, and closes them again when it comes back.
+const RELEASE_ON_BACKGROUND = isIos();
+
+function releaseForBackground() {
+  if (!RELEASE_ON_BACKGROUND) return;
+  let count = 0;
+  for (const attempt of attempts.values()) {
+    if (attempt.cancelled) continue;
+    attempt.cancelled = true;                    // the attempt cleans up after itself
+    const name = attempt.device.name || attempt.device.id;
+    releasedDevices.push({ device: attempt.device, name });
+    releaseDevice(attempt.device, name);
+    count++;
+  }
+  for (const conn of connections.slice()) {
+    releasedDevices.push({ device: conn.device, name: conn.name });
+    disconnectConnection(conn);
+    count++;
+  }
+  if (!count) return;
+  sendQueue.length = 0;
+  log('Page left the foreground: closed ' + count + ' connection(s) to free the boards.');
+  updateUI();
+}
+
+function onBackInForeground() {
+  // Close the links a second time, now that the page can run normally.
+  for (const item of releasedDevices) releaseDevice(item.device, item.name);
+  if (releasedDevices.length) {
+    const names = releasedDevices.map((item) => item.name).join(', ');
+    setStatus('The page was in the background, so ' + names + ' ' +
+              (releasedDevices.length === 1 ? 'was' : 'were') + ' disconnected. ' +
+              'Tap "Connect a BLE device" to connect again.', 'error');
+    releasedDevices = [];
+  }
+  // Drop any connection that the browser itself reports as closed.
+  for (const conn of connections.slice()) {
+    if (!conn.device.gatt.connected) {
+      disconnectConnection(conn);
+      log('Dropped a connection that was lost in the background: ' + conn.name);
+    }
+  }
+  updateUI();
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') releaseForBackground();
+  else onBackInForeground();
+  updateWakeLock();
+});
+window.addEventListener('pagehide', releaseForBackground);
+
+// ---------------------------------------------------------------------------
+// Keep the screen awake while connected (if the browser allows it)
+// ---------------------------------------------------------------------------
+async function updateWakeLock() {
+  if (!('wakeLock' in navigator) || wakeLockBusy || wakeLockUnavailable) return;
+  wakeLockBusy = true;
+  try {
+    const want = connections.length > 0 && document.visibilityState === 'visible';
+    if (want && !wakeLock) {
+      wakeLock = await navigator.wakeLock.request('screen');
+      wakeLock.addEventListener('release', () => { wakeLock = null; });
+    } else if (!want && wakeLock) {
+      const lock = wakeLock;
+      wakeLock = null;
+      await lock.release();
+    }
+  } catch (err) {
+    wakeLockUnavailable = true;                  // do not keep retrying
+    log('Screen wake lock not available: ' + describeError(err));
+  } finally {
+    wakeLockBusy = false;
+  }
+  // The connection state may have changed while the request was in flight: re-check once.
+  const wantNow = connections.length > 0 && document.visibilityState === 'visible';
+  if (!wakeLockUnavailable && wantNow !== !!wakeLock) updateWakeLock();
 }
 
 // ---------------------------------------------------------------------------
@@ -597,7 +769,13 @@ async function pump() {
         const msg = failed.map((x) => x.conn.name + ': ' +
           ((x.r.reason && x.r.reason.message) || x.r.reason)).join('; ');
         log('Send failed: ' + msg);
-        setStatus('Send failed: ' + msg, 'error');
+        // A link that is gone must not stay in the list (and must be released in Bluefy).
+        const dead = failed.filter((x) => !x.conn.device.gatt.connected ||
+          ['NetworkError', 'InvalidStateError'].includes(x.r.reason && x.r.reason.name));
+        for (const x of dead) disconnectConnection(x.conn);
+        if (dead.length) updateUI();
+        setStatus('Send failed: ' + msg + (dead.length
+          ? '. The connection was lost; tap "Connect a BLE device" to reconnect.' : ''), 'error');
       } else {
         const count = results[0].value;
         setStatus(count + ' text byte(s) submitted to ' + targets.length +
@@ -614,7 +792,7 @@ async function pump() {
 }
 
 function queueText(text) {
-  if (busy || !connections.length) return;
+  if (!connections.length) return;
   sendQueue.push(text);
   pump();
 }
@@ -640,7 +818,7 @@ els.modeSet.addEventListener('change', (event) => {
 
 els.sendForm.addEventListener('submit', (event) => {
   event.preventDefault();
-  if (busy || !connections.length) return;
+  if (!connections.length) return;
   const text = els.textEntry.value;
   if (!text) return;
   if (/[\r\n\0]/.test(text)) {
@@ -652,6 +830,7 @@ els.sendForm.addEventListener('submit', (event) => {
 });
 
 els.connectBtn.addEventListener('click', connectDevice);
+els.reconnectBtn.addEventListener('click', reconnectSaved);
 els.disconnectAllBtn.addEventListener('click', disconnectAll);
 
 // ---------------------------------------------------------------------------
@@ -670,6 +849,9 @@ if (!navigator.bluetooth) {
   setStatus('Web Bluetooth is not available in this browser.', 'error');
 } else if (!window.isSecureContext) {
   showBanner('Web Bluetooth needs a secure page. Open this page over https:// (or http://localhost).');
+}
+if (navigator.bluetooth && typeof navigator.bluetooth.getDevices === 'function') {
+  els.reconnectBtn.hidden = false;               // only offered where the browser supports it
 }
 updateUI();
 </script>
