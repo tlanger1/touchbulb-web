@@ -171,7 +171,7 @@
 
     <div class="sliderbox">
       <div class="sliderhead">
-        <label for="slider">Slide to send a digit (0&ndash;9)</label>
+        <label for="slider">Brightness control:</label>
         <output id="sliderValue" for="slider">0</output>
       </div>
       <input id="slider" type="range" min="0" max="9" step="1" value="0">
@@ -214,7 +214,7 @@
         <li>A successful Bluetooth write does not prove the board's microcontroller received the text. Check the board's UART output or the LED.</li>
         <li>You can tap "Connect another BLE device" again while a board is still connecting. The connections run in parallel.</li>
         <li>"Reconnect saved devices" turns yellow when boards that have connected before are not connected but can be reconnected directly: they were used earlier in this page session, or the page has just heard them advertising. After a page reload the browser has not scanned yet, so the page first listens for a few seconds. Boards it cannot reach directly get a red dot on "Manage devices": open it and tap "Pick from list" for each board. A board that never connected is shown as "Never connected" and is connected the same way.</li>
-        <li>Nothing is sent over the internet. If you switch on "Remember boards on this phone" (in "Manage devices"), the page keeps, on this phone only, which boards have connected and when, and uses Bluefy's list of saved boards. The switch is off by default. Switched off, the page keeps boards only while it stays open, and deletes anything it stored earlier.</li>
+        <li>Nothing is sent over the internet. If you switch on "Remember boards on this phone" (in "Manage devices"), the page keeps, on this phone only, which boards have connected and when, and uses Bluefy's list of saved boards. The switch is off by default. Switched off, the page keeps boards only for this browser tab (in temporary storage that is cleared when the tab is closed), so they survive iOS restarting the page while Bluefy is in the background, and it deletes anything it stored earlier.</li>
         <li>"Clear list" in "Manage devices" (two taps) starts from scratch: it disconnects everything, forgets the saved boards (or hides them on this page if the browser cannot forget them), clears the memory above and turns "Show all nearby devices" off. A hidden board comes back when you pick it from the Bluetooth list.</li>
         <li>Leaving Bluefy or locking the phone breaks Bluetooth connections. On iPhone this page then closes them itself so the boards are freed. Come back and tap "Reconnect saved devices" or "Connect a BLE device". The screen is kept awake while connected, if the browser allows it.</li>
         <li>Only one program can hold a connection to a board at a time. Close the Python app before connecting here.</li>
@@ -222,7 +222,7 @@
     </details>
   </section>
 
-  <footer id="version" class="version">TouchBulb BLE Controller, version 1.5</footer>
+  <footer id="version" class="version">TouchBulb BLE Controller, version 1.6</footer>
 </main>
 
 <!-- Boards sheet (opened by "Manage devices") -->
@@ -236,7 +236,7 @@
     <label class="switchrow" for="rememberToggle">
       <span class="switchtext">
         <span class="switchtitle">Remember boards on this phone</span>
-        <span id="rememberCaption" class="switchcaption">Off: nothing is kept after you reload.</span>
+        <span id="rememberCaption" class="switchcaption">Off: boards are forgotten when you close this tab.</span>
       </span>
       <input id="rememberToggle" class="switch" type="checkbox" role="switch">
     </label>
@@ -280,6 +280,7 @@ const SETTING_SHOW_ALL = 'touchbulb.showAll';
 const SETTING_CONNECTED_BEFORE = 'touchbulb.connectedBefore';
 const SETTING_HIDDEN = 'touchbulb.hidden';
 const SETTING_REMEMBER = 'touchbulb.remember';
+const SETTING_SESSION = 'touchbulb.session';       // sessionStorage: this tab's boards while the switch is off
 const BACKGROUND_NOTE = 'Disconnected when the page left the foreground.';
 const LOST_NOTE = 'The connection was lost.';
 
@@ -301,9 +302,11 @@ const boards = new Map();
 let nearbyChecking = false;           // listening for advertisements right now
 let nearbyUnsupportedLogged = false;
 // "Remember boards on this phone" (off by default, kept on this phone like the other settings).
-// When it is off the page writes no board memory to the phone and does not use Bluefy's saved
-// list: boards live in working memory only, while the page stays open. Anything an earlier
-// version stored is deleted whenever the page loads with the switch off.
+// When it is off the page writes no permanent board memory to the phone. Boards are kept for
+// this browser tab only (sessionStorage, cleared when the tab is closed), so they survive iOS
+// restarting the page in the background, and only boards from that tab record are listed from
+// Bluefy's saved list. Anything an earlier version stored is deleted whenever the page loads
+// with the switch off.
 let remember = loadSetting(SETTING_REMEMBER) === '1';
 if (!remember) {
   removeSetting(SETTING_CONNECTED_BEFORE);
@@ -382,9 +385,32 @@ function removeSetting(key) {
   try { localStorage.removeItem(key); } catch (_) { /* ignore */ }
 }
 
-// The board memory is only written to the phone when "Remember boards on this phone" is on.
+// The permanent board memory (and the hidden list) is only written to the phone when
+// "Remember boards on this phone" is on.
 function saveMemory(key, value) {
   if (remember) saveSetting(key, value);
+}
+
+// Temporary storage for the boards of THIS browser tab, used while the switch is off. It
+// survives the page being restarted (iOS can do that while Bluefy is in the background) and
+// is cleared when the tab is closed. It never leaves the phone.
+function loadSession(key) {
+  try { return sessionStorage.getItem(key); } catch (_) { return null; }
+}
+
+function saveSession(key, value) {
+  try { sessionStorage.setItem(key, value); } catch (_) { /* not essential */ }
+}
+
+function removeSession(key) {
+  try { sessionStorage.removeItem(key); } catch (_) { /* ignore */ }
+}
+
+// Write the board memory to where it belongs: this phone (switch on) or this tab (switch off).
+function persistConnectedBefore() {
+  const json = JSON.stringify(connectedBefore);
+  if (remember) saveSetting(SETTING_CONNECTED_BEFORE, json);
+  else saveSession(SETTING_SESSION, json);
 }
 
 const describeError = (err) => (err && err.message) || String(err);
@@ -393,9 +419,9 @@ const boardName = (device) => device.name || ('Unnamed device ' + String(device.
 
 // ---- memory of boards that have connected before ----
 function loadConnectedBefore() {
-  if (!remember) return {};                      // switch off: nothing from earlier visits is used
   try {
-    const raw = loadSetting(SETTING_CONNECTED_BEFORE);
+    // Switch off: only this tab's session record is used, never what earlier visits stored.
+    const raw = remember ? loadSetting(SETTING_CONNECTED_BEFORE) : loadSession(SETTING_SESSION);
     const data = raw ? JSON.parse(raw) : {};
     return data && typeof data === 'object' && !Array.isArray(data) ? data : {};
   } catch (_) {
@@ -409,13 +435,13 @@ const hasConnectedBefore = (device) => Object.prototype.hasOwnProperty.call(conn
 // the connection ends, so "last connected" means the last time it was really in use).
 function markConnected(device) {
   connectedBefore[device.id] = { lastConnected: Date.now(), name: device.name || '' };
-  saveMemory(SETTING_CONNECTED_BEFORE, JSON.stringify(connectedBefore));
+  persistConnectedBefore();
 }
 
 function forgetConnectedBefore(device) {
   if (!hasConnectedBefore(device)) return;
   delete connectedBefore[device.id];
-  saveMemory(SETTING_CONNECTED_BEFORE, JSON.stringify(connectedBefore));
+  persistConnectedBefore();
 }
 
 function loadHiddenIds() {
@@ -534,12 +560,17 @@ function stateText(board, status) {
 
 // Ask the browser which boards it has saved (picked earlier) and add them to the list.
 async function refreshSaved() {
-  if (!remember) return;                           // switch off: Bluefy's saved list is not used
   if (!navigator.bluetooth || typeof navigator.bluetooth.getDevices !== 'function') return;
+  // Switch off: only the boards of this tab's session record are listed. With no record there
+  // is nothing to look up, so Bluefy's saved list is not even read.
+  if (!remember && Object.keys(connectedBefore).length === 0) return;
   try {
     const saved = await navigator.bluetooth.getDevices();
     for (const device of saved) {
-      if (!hiddenIds.has(device.id)) getBoard(device);   // boards cleared from the list stay out
+      if (hiddenIds.has(device.id)) continue;                  // boards cleared from the list stay out
+      if (!remember && !hasConnectedBefore(device)) continue;  // off: only this tab's boards
+      const board = getBoard(device);
+      if (!remember) board.session = true;
     }
   } catch (err) {
     log('Saved device list not available: ' + describeError(err));
@@ -724,7 +755,7 @@ function updateUI() {
   els.rememberToggle.checked = remember;
   els.rememberCaption.textContent = remember
     ? 'On: boards are remembered on this phone only.'
-    : 'Off: nothing is kept after you reload.';
+    : 'Off: boards are forgotten when you close this tab.';
 
   // "Clear list": needs something to clear; after one tap it asks for a second tap.
   const clearArmed = clearArmedAt && Date.now() - clearArmedAt < 4000;
@@ -1123,6 +1154,7 @@ function setRemember(on) {
     // boards Bluefy has saved.
     saveSetting(SETTING_CONNECTED_BEFORE, JSON.stringify(connectedBefore));
     saveHiddenIds();
+    removeSession(SETTING_SESSION);              // the permanent memory takes over from the tab record
     log('Remembering boards on this phone: on.');
     setStatus('Boards will be remembered on this phone.');
     updateUI();
@@ -1140,6 +1172,7 @@ function setRemember(on) {
       delete connectedBefore[id];
     }
   }
+  persistConnectedBefore();                      // the boards left are kept for this browser tab only
   log('Remembering boards on this phone: off. The stored memory was deleted.');
   setStatus('Boards are no longer remembered. What was stored on this phone was deleted.');
   updateUI();
@@ -1190,7 +1223,7 @@ async function clearList() {
   boards.clear();
   releasedDevices = [];
   connectedBefore = {};
-  saveMemory(SETTING_CONNECTED_BEFORE, '{}');
+  persistConnectedBefore();                      // connectedBefore was just emptied above
   els.showAll.checked = false;
   saveSetting(SETTING_SHOW_ALL, '0');
   resetControls();
@@ -1540,6 +1573,11 @@ if (navigator.bluetooth && typeof navigator.bluetooth.getDevices === 'function')
   els.reconnectBtn.hidden = false;               // only offered where the browser supports it
   refreshSaved().then(checkNearby);              // list the boards the browser knows, then listen for them
 }
+// A line like this appears in the activity log every time the page (re)starts, so a restart
+// by iOS while Bluefy was in the background can be seen.
+log('Page loaded. Remember boards on this phone: ' + (remember ? 'on' : 'off') +
+    (!remember && Object.keys(connectedBefore).length
+      ? ' (' + Object.keys(connectedBefore).length + ' board(s) kept for this tab)' : '') + '.');
 </script>
 </body>
 </html>

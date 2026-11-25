@@ -4,6 +4,18 @@ Upload index.html and release_notes.txt together to the same GitHub folder.
 The version number is also shown at the bottom of the page, so you can see
 whether the phone loaded the new file.
 
+Version 1.6 - 2026-11-25
+- Fix: with "Remember boards on this phone" off, leaving Bluefy and coming back
+  emptied the board list, because iOS can restart the page while Bluefy is in the
+  background. The page now keeps this session's boards for this browser tab only,
+  in temporary storage that is cleared when the tab is closed. After a restart it
+  lists just those boards, listens for them, and the yellow button works again.
+  The caption now reads "Off: boards are forgotten when you close this tab."
+  Nothing is stored permanently while the switch is off.
+- The activity log now starts with a "Page loaded" line, so you can see when the
+  page was restarted.
+- The slider label now reads "Brightness control:".
+
 Version 1.5 - 2026-11-25
 - New switch "Remember boards on this phone" at the top of "Manage devices",
   OFF by default. Off: the page stores no board list on the phone and does not
