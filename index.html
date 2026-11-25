@@ -84,6 +84,7 @@
     white-space: pre-wrap; overflow-wrap: anywhere;
   }
   ul.notes { margin: 8px 0 0; padding-left: 20px; color: var(--muted); font-size: 0.9rem; }
+  .version { text-align: center; color: var(--muted); font-size: 0.8rem; padding: 4px 0 8px; }
 
   /* Boards sheet: slides over the page, the list scrolls inside it */
   .sheet { position: fixed; inset: 0; z-index: 10; display: flex; align-items: flex-end; justify-content: center; }
@@ -180,12 +181,15 @@
       <ul class="notes">
         <li>A successful Bluetooth write does not prove the board's microcontroller received the text. Check the board's UART output or the LED.</li>
         <li>You can tap "Connect another BLE device" again while a board is still connecting. The connections run in parallel.</li>
-        <li>"Reconnect saved devices" turns yellow when saved boards are not connected. A board that could not be reached is not counted again until you return to this page or retry it from "Manage devices".</li>
+        <li>"Reconnect saved devices" turns yellow when boards that have connected before are not connected. A board that could not be reached is not counted again until you return to this page or retry it from "Manage devices". A board that never connected is shown as "Never connected": connect it once by hand with "Connect a BLE device" or the Connect button in "Manage devices".</li>
+        <li>This page remembers, on this phone only, which boards have connected and when. Forgetting a board in "Manage devices" also removes it from that memory.</li>
         <li>Leaving Bluefy or locking the phone breaks Bluetooth connections. On iPhone this page then closes them itself so the boards are freed. Come back and tap "Reconnect saved devices" or "Connect a BLE device". The screen is kept awake while connected, if the browser allows it.</li>
         <li>Only one program can hold a connection to a board at a time. Close the Python app before connecting here.</li>
       </ul>
     </details>
   </section>
+
+  <footer id="version" class="version">TouchBulb BLE Controller, version 1.1</footer>
 </main>
 
 <!-- Boards sheet (opened by "Manage devices") -->
@@ -231,6 +235,7 @@ const SEND_TIMEOUT_MS = 15000;
 const NAME_PREFIXES = ['BT24', 'DX-BT24', 'Touch'];
 
 const SETTING_SHOW_ALL = 'touchbulb.showAll';
+const SETTING_CONNECTED_BEFORE = 'touchbulb.connectedBefore';
 const BACKGROUND_NOTE = 'Disconnected when the page left the foreground.';
 const LOST_NOTE = 'The connection was lost.';
 
@@ -247,6 +252,10 @@ const attempts = new Map();   // device.id -> {device, cancelled, reason, cancel
 //          returns to the foreground or the board is retried by hand
 //   note:  why an idle board is not connected (lost, background, cancelled)
 const boards = new Map();
+// Boards that have fully connected at least once, kept on this phone only:
+// device.id -> {lastConnected: milliseconds since 1970, name}. The browser's saved list
+// also contains boards that were only picked (or failed to connect), so it cannot say this.
+let connectedBefore = loadConnectedBefore();
 let releasedDevices = [];     // {device, name} closed because the page left the foreground
 let wakeLock = null;
 let wakeLockBusy = false;
@@ -311,6 +320,44 @@ const describeError = (err) => (err && err.message) || String(err);
 const sameUuid = (a, b) => String(a).toLowerCase() === String(b).toLowerCase();
 const boardName = (device) => device.name || ('Unnamed device ' + String(device.id).slice(-4));
 
+// ---- memory of boards that have connected before ----
+function loadConnectedBefore() {
+  try {
+    const raw = loadSetting(SETTING_CONNECTED_BEFORE);
+    const data = raw ? JSON.parse(raw) : {};
+    return data && typeof data === 'object' && !Array.isArray(data) ? data : {};
+  } catch (_) {
+    return {};                                   // unreadable data: start with an empty memory
+  }
+}
+
+const hasConnectedBefore = (device) => Object.prototype.hasOwnProperty.call(connectedBefore, device.id);
+
+// Record that this board is working now (called on every successful connect, and again when
+// the connection ends, so "last connected" means the last time it was really in use).
+function markConnected(device) {
+  connectedBefore[device.id] = { lastConnected: Date.now(), name: device.name || '' };
+  saveSetting(SETTING_CONNECTED_BEFORE, JSON.stringify(connectedBefore));
+}
+
+function forgetConnectedBefore(device) {
+  if (!hasConnectedBefore(device)) return;
+  delete connectedBefore[device.id];
+  saveSetting(SETTING_CONNECTED_BEFORE, JSON.stringify(connectedBefore));
+}
+
+function timeAgo(ms) {
+  const seconds = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (seconds < 60) return 'just now';
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return minutes + ' min ago';
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return hours + ' h ago';
+  const days = Math.round(hours / 24);
+  if (days < 30) return days + (days === 1 ? ' day ago' : ' days ago');
+  return 'on ' + new Date(ms).toLocaleDateString();
+}
+
 // Turn a browser/Bluetooth error into a plain-language message.
 function friendlyError(err, stage) {
   const name = err && err.name;
@@ -363,12 +410,17 @@ function boardStatus(board) {
 
 function summaryText(all) {
   if (!all.length) return 'No boards yet. Tap "Connect a BLE device".';
-  const count = { connected: 0, connecting: 0, idle: 0, failed: 0 };
-  for (const board of all) count[boardStatus(board)]++;
+  const count = { connected: 0, connecting: 0, idle: 0, never: 0, failed: 0 };
+  for (const board of all) {
+    const status = boardStatus(board);
+    if (status === 'idle' && !hasConnectedBefore(board.device)) count.never++;
+    else count[status]++;
+  }
   const parts = [];
   if (count.connected) parts.push(count.connected + ' connected');
   if (count.connecting) parts.push(count.connecting + ' connecting');
   if (count.idle) parts.push(count.idle + ' not connected');
+  if (count.never) parts.push(count.never + ' never connected');
   if (count.failed) parts.push(count.failed + " couldn't connect");
   return 'Boards: ' + parts.join(', ');
 }
@@ -376,8 +428,10 @@ function summaryText(all) {
 function stateText(board, status) {
   if (status === 'connected') return 'Connected (' + connectionOf(board).profile + ')';
   if (status === 'connecting') return 'Connecting...';
-  if (status === 'failed') return "Couldn't connect: " + board.error;
-  return board.note || 'Not connected';
+  const last = connectedBefore[board.device.id];
+  const lastText = last ? ' Last connected ' + timeAgo(last.lastConnected) + '.' : '';
+  if (status === 'failed') return "Couldn't connect: " + board.error + lastText;
+  return (board.note || (last ? 'Not connected.' : 'Never connected.')) + lastText;
 }
 
 // Ask the browser which boards it has saved (picked earlier) and add them to the list.
@@ -464,9 +518,11 @@ function updateUI() {
   els.connectBtn.textContent = (connected || pending > 0) ? 'Connect another BLE device' : 'Connect a BLE device';
 
   // Yellow only when there is something to reconnect that is worth trying now.
-  // A board that failed is skipped (muted) until you return to the page or retry it by hand.
+  // Only boards that have connected before are counted. A board that failed is skipped
+  // (muted) until you return to the page or retry it by hand.
   const reconnectable = all.filter((board, i) =>
-    (statuses[i] === 'idle' || statuses[i] === 'failed') && !board.muted).length;
+    (statuses[i] === 'idle' || statuses[i] === 'failed') &&
+    hasConnectedBefore(board.device) && !board.muted).length;
   els.reconnectBtn.disabled = !navigator.bluetooth || reconnectable === 0;
   els.reconnectBtn.textContent = reconnectable > 0
     ? 'Reconnect saved devices (' + reconnectable + ')' : 'Reconnect saved devices';
@@ -713,6 +769,7 @@ async function startConnect(device, options) {
     const first = connections.length === 0;
     connections.push(conn);
     if (first) resetControls();
+    markConnected(device);                      // remember that this board works
     log('Connected: ' + conn.name + ' (' + conn.profile + ')');
     const others = pending - 1;                 // this attempt is still counted in `pending`
     setStatus('Connected to ' + conn.name + ' (' + conn.profile + ')' +
@@ -777,13 +834,15 @@ async function connectBoards(targets, emptyMessage) {
   }
 }
 
-// The yellow button: saved boards that are not connected and have not just failed.
+// The yellow button: boards that have connected before, are not connected now, and have
+// not just failed. Boards never connected are left alone: connect them once by hand.
 async function reconnectSaved() {
   await refreshSaved();
   const targets = Array.from(boards.values()).filter((b) =>
-    ['idle', 'failed'].includes(boardStatus(b)) && !b.muted);
+    ['idle', 'failed'].includes(boardStatus(b)) && hasConnectedBefore(b.device) && !b.muted);
   await connectBoards(targets,
-    'No saved boards to reconnect. Connect each board once with "Connect a BLE device" first.');
+    'No board that connected before is waiting to be reconnected. ' +
+    'Connect a new board once with "Connect a BLE device" or from "Manage devices".');
 }
 
 // "Connect all" in the Boards sheet: every board that is not connected, including failed ones.
@@ -811,6 +870,7 @@ async function forgetBoard(board) {
   try {
     await board.device.forget();
     boards.delete(board.device.id);
+    forgetConnectedBefore(board.device);
     log('Forgot ' + name);
     setStatus('Forgot ' + name + '. Pick it again with "Connect a BLE device" to use it later.');
   } catch (err) {
@@ -829,6 +889,7 @@ function removeConnection(conn) {
 function onDisconnected(conn) {
   if (conn.closing) return;                    // user-initiated; handled by the caller
   if (!removeConnection(conn)) return;         // never made it into the list
+  markConnected(conn.device);                  // it was working until just now
   getBoard(conn.device).note = LOST_NOTE;
   log('Disconnected unexpectedly: ' + conn.name);
   if (!connections.length) {
@@ -855,6 +916,7 @@ function disconnectConnection(conn) {
   conn.closing = true;
   releaseDevice(conn.device, conn.name);
   removeConnection(conn);
+  markConnected(conn.device);                  // "last connected" = when it was last in use
   getBoard(conn.device).note = '';             // callers set a reason if there is one
 }
 
